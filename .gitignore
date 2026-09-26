@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Cache and temporary model binaries
+/lib/
+/.cache/
+/models/*.onnx
+/models/*.onnx.data
+/models/*.bin
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,43 @@
+# ==============================================================================
+# JetOrt - High-Performance NVIDIA CUDA & TensorRT Container
+# ==============================================================================
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+WORKDIR /build
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release --features cuda,tensorrt
+
+# Runtime Stage
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/jetort /app/jetort
+COPY config.yaml /app/config.yaml
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/jetort"]
+CMD ["--config", "/app/config.yaml"]

@@ -1,0 +1,23 @@
+[Unit]
+Description=JetOrt - Lightweight Universal ONNX Tensor Inference Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@PROJECT_ROOT@
+Environment=CUDA_MODULE_LOADING=LAZY
+Environment="ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so"
+Environment="OGA_DYLIB_PATH=/usr/local/lib/libonnxruntime-genai.so"
+Environment="ORT_GENAI_DYLIB_PATH=/usr/local/lib/libonnxruntime-genai.so"
+Environment="LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:/usr/local/lib"
+Environment=RUST_LOG=jetort=info,ort=warn,tower_http=warn
+ExecStart=@JETORT_BIN@ --config @PROJECT_ROOT@/config.yaml
+Restart=always
+RestartSec=5
+TimeoutStartSec=infinity
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
