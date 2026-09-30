@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Classification of a model graph. Autoregressive models are refused at load.
+/// Set `engine_kind` only when automatic detection cannot decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EngineKind {
+    #[serde(rename = "oneshot", alias = "one_shot", alias = "one-shot")]
+    OneShot,
+    #[serde(rename = "autoregressive")]
+    Autoregressive,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -22,15 +32,6 @@ pub struct ServerConfig {
     /// Optional path to libonnxruntime.so (if omitted, auto-discovered from Python/system)
     #[serde(default)]
     pub ort_dylib_path: Option<String>,
-
-    /// Optional path to libonnxruntime-genai.so (if omitted, auto-discovered from system/environment)
-    #[serde(
-        default,
-        alias = "genai_dylib_path",
-        alias = "ort_genai_dylib_path",
-        alias = "oga_dylib_path"
-    )]
-    pub genai_dylib_path: Option<String>,
 }
 
 fn default_host() -> String {
@@ -201,10 +202,27 @@ pub struct ModelConfig {
     /// Base configuration directory (populated at load time for relative path resolution)
     #[serde(skip)]
     pub config_dir: Option<PathBuf>,
+
+    /// Used only when graph and framework detection disagree. Not a third engine.
+    #[serde(default)]
+    pub engine_kind: Option<EngineKind>,
 }
+
+pub const CONCURRENCY_CAP: usize = 5;
 
 fn default_session_pool_size() -> usize {
     1
+}
+
+/// Jetson 1, discrete NVIDIA GPU 2, CPU 1. Never above [`CONCURRENCY_CAP`].
+pub fn default_concurrency_limit() -> usize {
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        1
+    } else if cfg!(feature = "cuda") || cfg!(feature = "tensorrt") {
+        2
+    } else {
+        1
+    }
 }
 
 fn default_trt_max_workspace_mb() -> Option<usize> {
@@ -246,8 +264,15 @@ fn default_n_batch() -> usize {
 }
 
 impl ModelConfig {
+    /// Context length. `pad_seq_len` is a separate static-shape hint and is not a context.
     pub fn effective_n_ctx(&self) -> Option<usize> {
-        self.n_ctx.or(self.pad_seq_len).filter(|&v| v > 0)
+        self.n_ctx.filter(|&v| v > 0)
+    }
+
+    pub fn effective_concurrency(&self) -> usize {
+        self.concurrency_limit
+            .unwrap_or_else(default_concurrency_limit)
+            .clamp(1, CONCURRENCY_CAP)
     }
 }
 
@@ -269,7 +294,6 @@ impl Default for ServerConfig {
             inference_threads: default_inference_threads(),
             log_level: default_log_level(),
             ort_dylib_path: None,
-            genai_dylib_path: None,
         }
     }
 }
@@ -300,7 +324,30 @@ impl AppConfig {
         for m in &mut config.models {
             m.config_dir = config_dir.clone();
         }
+        config.validate()?;
 
         Ok(config)
+    }
+
+    fn validate(&mut self) -> Result<(), AppError> {
+        for model in &mut self.models {
+            if model.session_pool_size == 0 || model.session_pool_size > CONCURRENCY_CAP {
+                return Err(AppError::Config(format!(
+                    "Model '{}' session_pool_size must be 1..={CONCURRENCY_CAP} (small pool, not a queue of sessions)",
+                    model.name
+                )));
+            }
+            let concurrency = model
+                .concurrency_limit
+                .unwrap_or_else(default_concurrency_limit);
+            if concurrency == 0 || concurrency > CONCURRENCY_CAP {
+                return Err(AppError::Config(format!(
+                    "Model '{}' concurrency_limit must be 1..={CONCURRENCY_CAP}",
+                    model.name
+                )));
+            }
+            model.concurrency_limit = Some(concurrency);
+        }
+        Ok(())
     }
 }

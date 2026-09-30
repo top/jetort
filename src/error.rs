@@ -34,6 +34,9 @@ pub enum AppError {
 
     #[error("Internal runtime error: {0}")]
     Internal(String),
+
+    #[error("{0}")]
+    NotImplemented(String),
 }
 
 #[derive(Serialize)]
@@ -110,6 +113,13 @@ impl IntoResponse for AppError {
                 None,
                 None,
                 None,
+            ),
+            AppError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                msg.clone(),
+                Some("not_implemented".to_string()),
+                None,
+                Some(false),
             ),
         };
 

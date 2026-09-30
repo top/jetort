@@ -3,13 +3,12 @@ server:
   log_level: info
 
 models:
-  - name: MiniCPM5-2B
-    path: /home/ray/quant_pipeline/work/openbmb_MiniCPM5-2B/genai_int8_mixed_cuda
-    file: model.onnx
-    ctx_size: 32768
+#  - name: MiniCPM5-2B
+#    path: /home/ray/quant_pipeline/work/openbmb_MiniCPM5-2B/genai_int8_mixed_cuda
+#    file: model.onnx
+#    ctx_size: 32768
 
   - name: Qwen3-Embedding-0.6B
-    alias: text-embedding-3-small
     path: /home/ray/quant_pipeline/work/Qwen_Qwen3-Embedding-0.6B
     file: model_fp16.onnx
 
@@ -21,6 +20,6 @@ models:
     path: /home/ray/quant_pipeline/work/convaiinnovations_laya/
     file: model_fp16.onnx
 
-  - name: Confucius-R2T2
-    path: /home/ray/quant_pipeline/work/netease-youdao_Confucius4-R2T2/bundle/
-    file: model.onnx
+#  - name: Confucius-R2T2
+#    path: /home/ray/quant_pipeline/work/netease-youdao_Confucius4-R2T2/bundle/
+#    file: model.onnx

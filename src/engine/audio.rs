@@ -382,27 +382,40 @@ pub fn compute_log_mel_128(samples: &[f32]) -> Vec<f32> {
 
     let mel_filters = create_mel_filters_slaney(N_MELS, NUM_BINS, 16000.0);
 
-    let mut mel_spec = vec![0.0f32; N_MELS * NB_MAX_FRAMES];
-    let mut frame = [0.0f32; N_FFT];
-    let mut power = [0.0f32; NUM_BINS];
     // Precompute the DFT twiddle table once and reuse across all 3000 frames (n_fft=400 isn't a
     // power of 2, so a direct DFT is used instead of `fft_in_place`; recomputing cos/sin per
     // frame would be ~3000x wasted work since the table only depends on n_fft/num_bins).
     let twiddles = build_dft_twiddles(N_FFT, NUM_BINS);
 
-    for t in 0..NB_MAX_FRAMES {
-        let start = t * HOP_LENGTH;
-        for i in 0..N_FFT {
-            frame[i] = padded[start + i] * window[i];
-        }
-        compute_dft_power_spectrum(&frame, &twiddles, NUM_BINS, &mut power);
-        for m in 0..N_MELS {
-            let filter = &mel_filters[m];
-            let mut e = 0.0f32;
-            for k in 0..NUM_BINS {
-                e += power[k] * filter[k];
+    // ponytail: direct DFT parallelized over frames (~8x on Orin) instead of a mixed-radix FFT
+    // crate; switch to rustfft if mel ever shows up in profiles again.
+    use rayon::prelude::*;
+    let mut frame_major = vec![0.0f32; NB_MAX_FRAMES * N_MELS];
+    frame_major
+        .par_chunks_mut(N_MELS)
+        .enumerate()
+        .for_each(|(t, out)| {
+            let window_samples = &padded[t * HOP_LENGTH..t * HOP_LENGTH + N_FFT];
+            // Zero-padding frames (audio shorter than 30s) have an exactly-zero spectrum.
+            if window_samples.iter().all(|&s| s == 0.0) {
+                return;
             }
-            mel_spec[m * NB_MAX_FRAMES + t] = e;
+            let mut frame = [0.0f32; N_FFT];
+            for i in 0..N_FFT {
+                frame[i] = window_samples[i] * window[i];
+            }
+            let mut power = [0.0f32; NUM_BINS];
+            compute_dft_power_spectrum(&frame, &twiddles, NUM_BINS, &mut power);
+            for (m, e) in out.iter_mut().enumerate() {
+                *e = power.iter().zip(&mel_filters[m]).map(|(p, f)| p * f).sum();
+            }
+        });
+
+    // Transpose [frames, mels] -> mel-major [mels, frames] expected by the encoder graph.
+    let mut mel_spec = vec![0.0f32; N_MELS * NB_MAX_FRAMES];
+    for t in 0..NB_MAX_FRAMES {
+        for m in 0..N_MELS {
+            mel_spec[m * NB_MAX_FRAMES + t] = frame_major[t * N_MELS + m];
         }
     }
 
@@ -419,6 +432,20 @@ pub fn compute_log_mel_128(samples: &[f32]) -> Vec<f32> {
     }
 
     mel_spec
+}
+
+/// Frames of `samples` that are real audio inside the fixed 3000-frame mel.
+/// Trailing frames are zero-padding to 30s and must not be masked as speech.
+pub fn log_mel_128_content_frames(sample_count: usize) -> usize {
+    const HOP_LENGTH: usize = 160;
+    const MAX_SAMPLES: usize = 480_000;
+    const MAX_FRAMES: usize = 3000;
+    let n = sample_count.min(MAX_SAMPLES);
+    if n == 0 {
+        0
+    } else {
+        n.div_ceil(HOP_LENGTH).min(MAX_FRAMES)
+    }
 }
 
 /// Precomputes `(cos, sin)` twiddle factors for a direct DFT: one `(cos, sin)` pair per
@@ -438,7 +465,12 @@ fn build_dft_twiddles(n_fft: usize, num_bins: usize) -> Vec<(f32, f32)> {
 /// Direct O(n_fft * num_bins) DFT magnitude^2 spectrum using a precomputed twiddle table
 /// (see `build_dft_twiddles`). `n_fft=400` isn't a power of 2, so the radix-2 `fft_in_place`
 /// used by `compute_fbank_80` doesn't apply here.
-fn compute_dft_power_spectrum(signal: &[f32], twiddles: &[(f32, f32)], num_bins: usize, output: &mut [f32]) {
+fn compute_dft_power_spectrum(
+    signal: &[f32],
+    twiddles: &[(f32, f32)],
+    num_bins: usize,
+    output: &mut [f32],
+) {
     let n = signal.len();
     for (k, out) in output.iter_mut().enumerate().take(num_bins) {
         let row = &twiddles[k * n..k * n + n];
@@ -517,7 +549,12 @@ fn create_mel_filters_slaney(n_mels: usize, num_bins: usize, sample_rate: f32) -
 
 /// Standard CTC Greedy Search Decoder:
 /// Picks argmax for each frame, collapses consecutive duplicate tokens, and skips blank token (index 0).
-pub fn ctc_greedy_decode(logprobs: &[f32], num_frames: usize, vocab_size: usize, blank_id: usize) -> Vec<u32> {
+pub fn ctc_greedy_decode(
+    logprobs: &[f32],
+    num_frames: usize,
+    vocab_size: usize,
+    blank_id: usize,
+) -> Vec<u32> {
     let mut tokens = Vec::new();
     let mut prev_token = None;
 
@@ -534,10 +571,9 @@ pub fn ctc_greedy_decode(logprobs: &[f32], num_frames: usize, vocab_size: usize,
             }
         }
 
-        if max_idx != blank_id
-            && prev_token != Some(max_idx) {
-                tokens.push(max_idx as u32);
-            }
+        if max_idx != blank_id && prev_token != Some(max_idx) {
+            tokens.push(max_idx as u32);
+        }
         prev_token = Some(max_idx);
     }
 
@@ -561,12 +597,12 @@ mod tests {
         // "fmt " subchunk
         bytes.extend_from_slice(b"fmt ");
         bytes.extend_from_slice(&16u32.to_le_bytes()); // subchunk1 size
-        bytes.extend_from_slice(&1u16.to_le_bytes());  // PCM format
-        bytes.extend_from_slice(&1u16.to_le_bytes());  // 1 channel (mono)
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // 1 channel (mono)
         bytes.extend_from_slice(&sample_rate.to_le_bytes());
         let byte_rate = sample_rate * 2;
         bytes.extend_from_slice(&byte_rate.to_le_bytes());
-        bytes.extend_from_slice(&2u16.to_le_bytes());  // block align
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
         bytes.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
 
         // "data" subchunk

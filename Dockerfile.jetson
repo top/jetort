@@ -21,8 +21,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# Build with TensorRT & CUDA support on aarch64
-RUN cargo build --release --features cuda,tensorrt
+# Jetson Orin compute capability 8.7. build.rs records JETORT_CUDA_ARCH.
+ENV JETORT_CUDA_ARCH=87
+ENV TARGET_CUDA_ARCH=87
+ENV CMAKE_CUDA_ARCHITECTURES=87
+RUN cargo build --release --no-default-features --features cuda,tensorrt
 
 # Runtime Stage
 FROM nvcr.io/nvidia/l4t-base:r36.2.0

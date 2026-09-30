@@ -3,7 +3,7 @@ use ort::session::builder::SessionBuilder;
 use std::io::Read;
 use tracing::info;
 #[cfg(feature = "tensorrt")]
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Detected precision of an ONNX model file, used to configure execution provider precision flags
 /// and drive the TensorRT precision fallback chain.
@@ -49,57 +49,7 @@ impl ModelPrecision {
 }
 
 pub fn get_candidate_providers(config: &ModelConfig) -> Vec<String> {
-    let use_auto = config.providers.is_empty()
-        || config
-            .providers
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case("auto"));
-
-    let candidate_providers = if use_auto {
-        let mut list = Vec::new();
-
-        #[cfg(target_os = "macos")]
-        {
-            list.push("coreml".to_string());
-            list.push("cpu".to_string());
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            list.push("tensorrt".to_string());
-            list.push("cuda".to_string());
-            list.push("directml".to_string());
-            list.push("cpu".to_string());
-        }
-
-        #[cfg(all(
-            target_os = "linux",
-            any(target_arch = "aarch64", target_arch = "x86_64")
-        ))]
-        {
-            list.push("tensorrt".to_string());
-            list.push("cuda".to_string());
-            list.push("cpu".to_string());
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            list.push("cpu".to_string());
-        }
-        list
-    } else {
-        let mut list = config.providers.clone();
-        #[cfg(feature = "cuda")]
-        if !list.iter().any(|p| p.eq_ignore_ascii_case("cuda")) {
-            list.push("cuda".to_string());
-        }
-        if !list.iter().any(|p| p.eq_ignore_ascii_case("cpu")) {
-            list.push("cpu".to_string());
-        }
-        list
-    };
-
-    candidate_providers
+    crate::engine::provider_chain::candidate_provider_names(config)
 }
 
 // Candidates ordering is determined cleanly by user configuration or default platform priority:
@@ -230,8 +180,353 @@ pub fn trt_cache_dir(config: &ModelConfig) -> String {
         .unwrap_or_else(|| format!(".cache/{}", config.name))
 }
 
+const TRT_MANIFEST_FILE: &str = "jetort-trt-manifest.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrtCacheManifest {
+    pub onnx_sha256: String,
+    pub tensorrt_version: String,
+    pub cuda_version: String,
+    pub driver_version: String,
+    pub compute_capability: String,
+    pub precision: String,
+    pub profile_shapes: String,
+}
+
+pub fn trt_profile_signature_from_shapes(
+    min_shapes: &str,
+    opt_shapes: &str,
+    max_shapes: &str,
+) -> String {
+    format!("min={min_shapes};opt={opt_shapes};max={max_shapes};buckets=128,256,512,1024")
+}
+
+/// Signature used for cache invalidation when only the config is known (no introspection yet).
+pub fn trt_profile_signature(config: &ModelConfig) -> String {
+    let profiles =
+        resolve_trt_dynamic_profiles(config, config.path.as_deref().map(std::path::Path::new));
+    trt_profile_signature_from_shapes(
+        &profiles.min_shapes,
+        &profiles.opt_shapes,
+        &profiles.max_shapes,
+    )
+}
+
+/// Resolve the min/opt/max profile strings that will be (or were) applied to TensorRT.
+/// This is the single source of truth for compile-time profiles and runtime bounds.
+pub fn resolve_trt_dynamic_profiles(
+    config: &ModelConfig,
+    model_path: Option<&std::path::Path>,
+) -> crate::engine::onnx_introspect::TrtDynamicProfiles {
+    if let (Some(min), Some(opt), Some(max)) = (
+        config.trt_profile_min_shapes.as_deref(),
+        config.trt_profile_opt_shapes.as_deref(),
+        config.trt_profile_max_shapes.as_deref(),
+    ) {
+        return crate::engine::onnx_introspect::TrtDynamicProfiles {
+            min_shapes: min.to_string(),
+            opt_shapes: opt.to_string(),
+            max_shapes: max.to_string(),
+        };
+    }
+
+    let len = crate::engine::provider_chain::trt_compile_max_seq(
+        config.effective_n_ctx().or_else(|| {
+            detect_model_max_position(
+                model_path.or_else(|| config.path.as_deref().map(std::path::Path::new)),
+            )
+        }),
+        config.pad_seq_len,
+    );
+    let max_batch = config.max_batch_size.clamp(1, 8);
+    let path_to_inspect = model_path.or_else(|| config.path.as_deref().map(std::path::Path::new));
+
+    if config.trt_profile_min_shapes.is_none() {
+        if let Some(p) = path_to_inspect {
+            if let Ok(inputs) = crate::engine::onnx_introspect::introspect_onnx_inputs(p) {
+                if !inputs.is_empty() {
+                    if let Some(auto) = crate::engine::onnx_introspect::synthesize_trt_profiles(
+                        &inputs, max_batch, len,
+                    ) {
+                        // Allow partial overrides for opt/max when only some are set.
+                        return crate::engine::onnx_introspect::TrtDynamicProfiles {
+                            min_shapes: config
+                                .trt_profile_min_shapes
+                                .clone()
+                                .unwrap_or(auto.min_shapes),
+                            opt_shapes: config
+                                .trt_profile_opt_shapes
+                                .clone()
+                                .unwrap_or(auto.opt_shapes),
+                            max_shapes: config
+                                .trt_profile_max_shapes
+                                .clone()
+                                .unwrap_or(auto.max_shapes),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let min_shapes = config
+        .trt_profile_min_shapes
+        .clone()
+        .unwrap_or_else(|| "input_ids:1x1,attention_mask:1x1".to_string());
+    let opt_shapes = config.trt_profile_opt_shapes.clone().unwrap_or_else(|| {
+        let opt_seq = (len / 2).clamp(64, len);
+        format!("input_ids:1x{opt_seq},attention_mask:1x{opt_seq}")
+    });
+    let max_shapes = config
+        .trt_profile_max_shapes
+        .clone()
+        .unwrap_or_else(|| format!("input_ids:{max_batch}x{len},attention_mask:{max_batch}x{len}"));
+    crate::engine::onnx_introspect::TrtDynamicProfiles {
+        min_shapes,
+        opt_shapes,
+        max_shapes,
+    }
+}
+
+/// Read max_position_embeddings / tokenizer model_max_length from the model directory.
+fn detect_model_max_position(model_path: Option<&std::path::Path>) -> Option<usize> {
+    let path = model_path?;
+    let dir = if path.is_file() { path.parent()? } else { path };
+    for name in ["config.json", "tokenizer_config.json"] {
+        let cfg_path = dir.join(name);
+        let Ok(text) = std::fs::read_to_string(&cfg_path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        for key in [
+            "max_position_embeddings",
+            "max_sequence_length",
+            "model_max_length",
+        ] {
+            if let Some(m) = v.get(key).and_then(|x| x.as_u64()) {
+                if m > 0 && m < 100_000_000 {
+                    return Some(m as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn manifest_matches(stored: &TrtCacheManifest, current: &TrtCacheManifest) -> bool {
+    // profile_shapes describes the engine that was built. A newer compile-time preference
+    // (e.g. widening max seq from 512 → 2048) must not force every Jetson cache to rebuild;
+    // over-profile requests fall back to CUDA at runtime instead.
+    stored.onnx_sha256 == current.onnx_sha256
+        && stored.tensorrt_version == current.tensorrt_version
+        && stored.cuda_version == current.cuda_version
+        && stored.driver_version == current.driver_version
+        && stored.compute_capability == current.compute_capability
+        && stored.precision == current.precision
+}
+
+pub fn hash_file_sha256(path: &std::path::Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+pub fn current_trt_manifest(
+    model_path: &std::path::Path,
+    precision: &str,
+    profile_shapes: &str,
+) -> Option<TrtCacheManifest> {
+    let (cuda_version, driver_version, compute_capability) = probe_nvidia_versions();
+    Some(TrtCacheManifest {
+        onnx_sha256: hash_file_sha256(model_path)?,
+        tensorrt_version: probe_tensorrt_version(),
+        cuda_version,
+        driver_version,
+        compute_capability,
+        precision: precision.to_string(),
+        profile_shapes: profile_shapes.to_string(),
+    })
+}
+
+pub fn read_trt_manifest(cache_dir: &str) -> Option<TrtCacheManifest> {
+    let path = std::path::Path::new(cache_dir).join(TRT_MANIFEST_FILE);
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn write_trt_manifest(cache_dir: &str, manifest: &TrtCacheManifest) -> std::io::Result<()> {
+    let dir = std::path::Path::new(cache_dir);
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(TRT_MANIFEST_FILE);
+    let body = serde_json::to_string_pretty(manifest)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    std::fs::write(path, body)
+}
+
+/// Runtime profile bounds for a loaded (or about-to-load) TensorRT cache.
+/// Prefers the manifest written at compile time; falls back to the historical
+/// silent default of max_seq=512 when the manifest has empty shapes.
+pub fn trt_runtime_profile_bounds(
+    cache_dir: &str,
+    config: &ModelConfig,
+) -> crate::engine::provider_chain::TrtProfileBounds {
+    if let Some(stored) = read_trt_manifest(cache_dir) {
+        if let Some(bounds) =
+            crate::engine::provider_chain::trt_profile_bounds_from_signature(&stored.profile_shapes)
+        {
+            return bounds;
+        }
+    }
+    // Legacy caches / empty signatures were built with pad_seq_len.unwrap_or(512).
+    let max_batch = config.max_batch_size.clamp(1, 8);
+    crate::engine::provider_chain::TrtProfileBounds {
+        min_batch: 1,
+        max_batch,
+        min_seq: 1,
+        max_seq: config.pad_seq_len.unwrap_or(512).clamp(64, 512),
+        opt_batch: 1,
+        opt_seq: 256.min(config.pad_seq_len.unwrap_or(512)),
+    }
+}
+
+/// Engine bytes plus a matching manifest. A missing or different manifest recompiles.
+pub fn trt_cache_is_current(cache_dir: &str, current: &TrtCacheManifest) -> bool {
+    has_cached_trt_engine(cache_dir)
+        && read_trt_manifest(cache_dir).is_some_and(|stored| manifest_matches(&stored, current))
+}
+
+pub fn quarantine_trt_cache(cache_dir: &str) -> std::io::Result<std::path::PathBuf> {
+    let src = std::path::Path::new(cache_dir);
+    if !src.exists() {
+        return Ok(src.to_path_buf());
+    }
+    let dest = std::path::PathBuf::from(format!("{cache_dir}.quarantine"));
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    std::fs::rename(src, &dest)?;
+    Ok(dest)
+}
+
+fn probe_tensorrt_version() -> String {
+    if let Ok(version) = std::env::var("TENSORRT_VERSION") {
+        if !version.trim().is_empty() {
+            return version.trim().to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+fn probe_nvidia_versions() -> (String, String, String) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=driver_version,compute_cap",
+            "--format=csv,noheader",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+        );
+    };
+    if !output.status.success() {
+        return (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "unknown".to_string(),
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.lines().next().unwrap_or("").split(',');
+    let driver = parts.next().unwrap_or("unknown").trim();
+    let cap = parts.next().unwrap_or("unknown").trim();
+    let cuda = std::env::var("CUDA_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    (
+        if cuda.is_empty() {
+            "unknown".to_string()
+        } else {
+            cuda
+        },
+        if driver.is_empty() {
+            "unknown".to_string()
+        } else {
+            driver.to_string()
+        },
+        if cap.is_empty() {
+            "unknown".to_string()
+        } else {
+            cap.to_string()
+        },
+    )
+}
+
+/// Shared TensorRT builder knobs applied by every compile/load path.
+/// Jetson uses a tight policy so Myelin autotune cannot exhaust unified memory;
+/// discrete-GPU targets keep ORT's higher default optimization level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrtBuilderPolicy {
+    /// ORT provider option `trt_builder_optimization_level` (0–5; ORT default 3).
+    pub optimization_level: u8,
+    /// Hard cap for `trt_max_workspace_size` in MB (never multi-GB tactic scratch).
+    pub max_workspace_mb: usize,
+    /// ORT `trt_force_sequential_engine_build` — lowers peak UMA during build.
+    pub force_sequential_engine_build: bool,
+    /// ORT `trt_build_heuristics_enable` — prefer heuristics over heavy timing.
+    pub build_heuristics: bool,
+}
+
+/// Jetson / tight unified-memory builder policy.
+///
+/// Level 0 (heuristic-only): ORT docs say levels below 3 trade engine quality for build
+/// time; level 0 disables timing-based tactic selection. Level 1 still exercised Myelin
+/// autotune hard enough to hit NvMap ENOMEM on 16GB Orin, so Jetson stays at 0.
+/// There is no supported ORT `trt_tactic_sources` token that disables Myelin
+/// (TRT TacticSource has no MYELIN flag), so we do not invent one.
+pub fn jetson_trt_builder_policy() -> TrtBuilderPolicy {
+    TrtBuilderPolicy {
+        optimization_level: 0,
+        max_workspace_mb: 256,
+        force_sequential_engine_build: true,
+        // ORT warns this is deprecated on TRT ≥8.6 and only meaningful at level 2.
+        build_heuristics: false,
+    }
+}
+
+/// Discrete-GPU / non-Tegra builder policy (ORT-like defaults, still workspace-capped).
+pub fn discrete_gpu_trt_builder_policy() -> TrtBuilderPolicy {
+    TrtBuilderPolicy {
+        optimization_level: 3,
+        max_workspace_mb: 512,
+        force_sequential_engine_build: false,
+        build_heuristics: false,
+    }
+}
+
+/// Select the builder policy for this compile target.
+pub fn trt_builder_policy() -> TrtBuilderPolicy {
+    if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        jetson_trt_builder_policy()
+    } else {
+        discrete_gpu_trt_builder_policy()
+    }
+}
+
 fn trt_workspace_mb(config: &ModelConfig, available_mb: f64) -> usize {
-    config.trt_max_workspace_mb.unwrap_or_else(|| {
+    let policy = trt_builder_policy();
+    let requested = config.trt_max_workspace_mb.unwrap_or_else(|| {
         if available_mb >= 4000.0 {
             512
         } else if available_mb >= 2000.0 {
@@ -239,7 +534,10 @@ fn trt_workspace_mb(config: &ModelConfig, available_mb: f64) -> usize {
         } else {
             256
         }
-    })
+    });
+    // Never ask TensorRT for multi-GB tactic scratch on any target; Jetson policy
+    // hard-caps at 512 MB even if config asks for more.
+    requested.min(policy.max_workspace_mb).max(64)
 }
 
 fn estimated_trt_build_memory_mb(model_size_mb: usize, workspace_mb: usize) -> usize {
@@ -572,14 +870,22 @@ pub fn build_tensorrt_ep(
     }
 
     let snap = crate::engine::memory::get_memory_snapshot();
+    let policy = trt_builder_policy();
     let workspace_mb = trt_workspace_mb(config, snap.system_available_mb);
     info!(
         model = %config.name,
         workspace_mb = workspace_mb,
+        builder_optimization_level = policy.optimization_level,
+        force_sequential_engine_build = policy.force_sequential_engine_build,
+        build_heuristics = policy.build_heuristics,
         context_memory_sharing = config.context_memory_sharing,
-        "Configuring TensorRT execution provider memory controls"
+        "Configuring TensorRT execution provider builder policy"
     );
-    trt = trt.with_max_workspace_size(workspace_mb * 1024 * 1024);
+    trt = trt
+        .with_max_workspace_size(workspace_mb * 1024 * 1024)
+        .with_builder_optimization_level(policy.optimization_level)
+        .with_force_sequential_engine_build(policy.force_sequential_engine_build)
+        .with_build_heuristics(policy.build_heuristics);
 
     let cache_dir = trt_cache_dir(config);
 
@@ -605,92 +911,128 @@ pub fn build_tensorrt_ep(
             .with_timing_cache_path(timing_cache_file);
     }
 
-    // Dynamic profile shapes configuration:
-    // 1. If explicit profiles provided in ModelConfig, prioritize user configuration
-    // 2. Otherwise, perform automated ONNX graph introspection to semantically deduce profiles
-    // 3. If introspection unavailable, fall back to safe universal transformer profiles
     let path_to_inspect = model_path.or_else(|| config.path.as_deref().map(std::path::Path::new));
-    let len = config.pad_seq_len.unwrap_or(512);
-    let max_batch = config.max_batch_size.clamp(1, 8);
+    let profiles = applied_trt_profiles(config, &cache_dir, path_to_inspect);
+    info!(
+        model = %config.name,
+        min = %profiles.min_shapes,
+        opt = %profiles.opt_shapes,
+        max = %profiles.max_shapes,
+        "Applying TensorRT dynamic profiles"
+    );
+    trt = trt
+        .with_profile_min_shapes(&profiles.min_shapes)
+        .with_profile_opt_shapes(&profiles.opt_shapes)
+        .with_profile_max_shapes(&profiles.max_shapes);
 
-    let has_cache = has_cached_trt_engine(&cache_dir);
-    if has_cache {
-        info!(
-            model = %config.name,
-            cache_dir = %cache_dir,
-            "⚡ Pre-compiled TensorRT engine cache detected; preserving engine cache profile alignment"
-        );
+    trt
+}
+
+/// Profiles actually fed to the TensorRT EP for this cache/config pair.
+///
+/// Compile and load share this builder so they cannot drift. When a cache already
+/// exists, batch/seq bounds come from the manifest (or the historical [1,1]..[4,512]
+/// default); shape *names* always come from ONNX introspection so every dynamic
+/// input (including `position_ids`) gets a profile.
+pub fn applied_trt_profiles(
+    config: &ModelConfig,
+    cache_dir: &str,
+    model_path: Option<&std::path::Path>,
+) -> crate::engine::onnx_introspect::TrtDynamicProfiles {
+    let path_to_inspect = model_path.or_else(|| config.path.as_deref().map(std::path::Path::new));
+
+    // Explicit full overrides win.
+    if let (Some(min), Some(opt), Some(max)) = (
+        config.trt_profile_min_shapes.as_deref(),
+        config.trt_profile_opt_shapes.as_deref(),
+        config.trt_profile_max_shapes.as_deref(),
+    ) {
+        return crate::engine::onnx_introspect::TrtDynamicProfiles {
+            min_shapes: min.to_string(),
+            opt_shapes: opt.to_string(),
+            max_shapes: max.to_string(),
+        };
     }
 
-    let mut auto_profiles = None;
-    // Always introspect the ONNX graph to synthesize profiles covering every dynamic input
-    // (e.g. input_ids/attention_mask/position_ids), unless the user specified explicit profiles.
-    // Introspection is cheap (just reads the ONNX header) and must run even when an engine
-    // cache already exists on disk: TensorRT still requires an EP profile option string that
-    // matches the graph's full input set at session-creation time, regardless of caching, and
-    // an incomplete fallback profile (missing e.g. position_ids) causes a build failure and a
-    // silent fallback to CUDA even though a valid cached engine could otherwise be reused.
-    if config.trt_profile_min_shapes.is_none() {
+    if has_cached_trt_engine(cache_dir) {
+        let bounds = trt_runtime_profile_bounds(cache_dir, config);
         if let Some(p) = path_to_inspect {
-            match crate::engine::onnx_introspect::introspect_onnx_inputs(p) {
-                Ok(inputs) if !inputs.is_empty() => {
-                    info!(
-                        model = %config.name,
-                        num_inputs = inputs.len(),
-                        "Auto-introspected ONNX graph input tensors: {:?}",
-                        inputs.iter().map(|i| (&i.name, &i.dims)).collect::<Vec<_>>()
-                    );
-                    auto_profiles = crate::engine::onnx_introspect::synthesize_trt_profiles(
-                        &inputs, max_batch, len,
-                    );
-                }
-                Ok(_) => {
-                    debug!(model = %config.name, "No graph inputs found during ONNX introspection; using universal fallback");
-                }
-                Err(e) => {
-                    debug!(model = %config.name, error = %e, "ONNX graph introspection skipped; using universal fallback");
+            if let Ok(inputs) = crate::engine::onnx_introspect::introspect_onnx_inputs(p) {
+                if !inputs.is_empty() {
+                    if let Some(auto) = crate::engine::onnx_introspect::synthesize_trt_profiles(
+                        &inputs,
+                        bounds.max_batch,
+                        bounds.max_seq,
+                    ) {
+                        info!(
+                            model = %config.name,
+                            max_batch = bounds.max_batch,
+                            max_seq = bounds.max_seq,
+                            inputs = inputs.len(),
+                            "Aligning TensorRT EP profiles to cached engine bounds for all ONNX inputs"
+                        );
+                        return auto;
+                    }
                 }
             }
         }
+        // Introspection failed: still emit at least the common transformer trio so
+        // position_ids is not silently dropped the way a two-name legacy string was.
+        return profiles_for_bounds(bounds);
     }
 
-    if let Some(ref min_s) = config.trt_profile_min_shapes {
-        trt = trt.with_profile_min_shapes(min_s);
-    } else if let Some(ref auto) = auto_profiles {
-        info!(
-            model = %config.name,
-            min = %auto.min_shapes,
-            opt = %auto.opt_shapes,
-            max = %auto.max_shapes,
-            "Applying auto-synthesized dynamic TensorRT profiles from ONNX graph introspection"
-        );
-        trt = trt
-            .with_profile_min_shapes(&auto.min_shapes)
-            .with_profile_opt_shapes(&auto.opt_shapes)
-            .with_profile_max_shapes(&auto.max_shapes);
-    } else {
-        // Universal default dynamic profile shapes for NLP/transformer/reranker models.
-        // This branch only runs if graph introspection above genuinely failed (e.g. unreadable
-        // ONNX file), in which case the model is unlikely to build successfully regardless;
-        // kept intentionally minimal/safe since profile entries for input names absent from
-        // the actual graph can cause a hard TensorRT build error rather than a clean fallback.
-        let min_shapes = "input_ids:1x1,attention_mask:1x1";
-        let opt_shapes = format!("input_ids:1x{len},attention_mask:1x{len}");
-        let max_shapes = format!("input_ids:{max_batch}x{len},attention_mask:{max_batch}x{len}");
-        trt = trt
-            .with_profile_min_shapes(min_shapes)
-            .with_profile_opt_shapes(opt_shapes)
-            .with_profile_max_shapes(max_shapes);
-    }
+    resolve_trt_dynamic_profiles(config, path_to_inspect)
+}
 
-    if let Some(ref opt_s) = config.trt_profile_opt_shapes {
-        trt = trt.with_profile_opt_shapes(opt_s);
+/// Universal NLP/transformer profile covering the inputs Qwen-style embedding graphs use.
+fn profiles_for_bounds(
+    bounds: crate::engine::provider_chain::TrtProfileBounds,
+) -> crate::engine::onnx_introspect::TrtDynamicProfiles {
+    let names = ["input_ids", "attention_mask", "position_ids"];
+    let min = names
+        .iter()
+        .map(|n| format!("{n}:{}x{}", bounds.min_batch, bounds.min_seq))
+        .collect::<Vec<_>>()
+        .join(",");
+    let opt = names
+        .iter()
+        .map(|n| format!("{n}:{}x{}", bounds.opt_batch, bounds.opt_seq))
+        .collect::<Vec<_>>()
+        .join(",");
+    let max = names
+        .iter()
+        .map(|n| format!("{n}:{}x{}", bounds.max_batch, bounds.max_seq))
+        .collect::<Vec<_>>()
+        .join(",");
+    crate::engine::onnx_introspect::TrtDynamicProfiles {
+        min_shapes: min,
+        opt_shapes: opt,
+        max_shapes: max,
     }
-    if let Some(ref max_s) = config.trt_profile_max_shapes {
-        trt = trt.with_profile_max_shapes(max_s);
-    }
+}
 
-    trt
+/// True when ORT rejected the session because EP options omitted a dynamic input's profile.
+/// This is a session-config bug, not a corrupt `.engine` file.
+pub fn is_missing_trt_shape_profile_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("no associated shape profiles")
+        || lower.contains("has no associated shape profiles")
+        || lower.contains("provide all the dynamic shape inputs")
+        || (lower.contains("dynamic shape") && lower.contains("profile"))
+}
+
+/// True when the engine bytes themselves look unusable (corruption / TRT mismatch).
+pub fn is_corrupt_trt_engine_error(err: &str) -> bool {
+    if is_missing_trt_shape_profile_error(err) {
+        return false;
+    }
+    let lower = err.to_ascii_lowercase();
+    lower.contains("engine")
+        && (lower.contains("deserialize")
+            || lower.contains("corrupt")
+            || lower.contains("incompatible")
+            || lower.contains("version")
+            || lower.contains("truncated"))
 }
 
 pub fn configure_builder_for_provider_with_precision(
@@ -806,6 +1148,12 @@ pub fn configure_execution_providers(
 #[cfg(test)]
 mod tests {
     use super::estimated_trt_build_memory_mb;
+    use super::{
+        is_corrupt_trt_engine_error, is_missing_trt_shape_profile_error, jetson_trt_builder_policy,
+        manifest_matches, profiles_for_bounds, trt_builder_policy, trt_cache_is_current,
+        TrtCacheManifest,
+    };
+    use crate::engine::provider_chain::TrtProfileBounds;
 
     #[test]
     fn trt_build_estimate_includes_weights_workspace_and_headroom() {
@@ -816,5 +1164,108 @@ mod tests {
 
         #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         assert_eq!(estimated, 3584);
+    }
+
+    #[test]
+    fn jetson_builder_policy_sets_level_and_workspace() {
+        let jetson = jetson_trt_builder_policy();
+        assert_eq!(jetson.optimization_level, 0);
+        assert_eq!(jetson.max_workspace_mb, 256);
+        assert!(jetson.force_sequential_engine_build);
+        assert!(!jetson.build_heuristics);
+
+        let selected = trt_builder_policy();
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            assert_eq!(selected, jetson);
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+        {
+            assert_eq!(selected.optimization_level, 3);
+            assert_eq!(selected.max_workspace_mb, 512);
+        }
+    }
+
+    #[test]
+    fn arch_manifest_match_skips_recompile() {
+        let current = TrtCacheManifest {
+            onnx_sha256: "abc".to_string(),
+            tensorrt_version: "10.0".to_string(),
+            cuda_version: "12.4".to_string(),
+            driver_version: "550".to_string(),
+            compute_capability: "8.7".to_string(),
+            precision: "FP16".to_string(),
+            profile_shapes:
+                "min=input_ids:1x1;opt=input_ids:1x256;max=input_ids:4x512;buckets=128,256,512,1024"
+                    .to_string(),
+        };
+        assert!(manifest_matches(&current, &current));
+        let mut changed = current.clone();
+        changed.onnx_sha256 = "def".to_string();
+        assert!(!manifest_matches(&current, &changed));
+        changed.onnx_sha256 = current.onnx_sha256.clone();
+        changed.compute_capability = "8.9".to_string();
+        assert!(!manifest_matches(&current, &changed));
+        // Widening intended compile profile must not invalidate an existing cache.
+        changed.compute_capability = current.compute_capability.clone();
+        changed.profile_shapes = "min=input_ids:1x1;max=input_ids:4x2048".to_string();
+        assert!(manifest_matches(&current, &changed));
+    }
+
+    #[test]
+    fn matching_manifest_does_not_request_recompile() {
+        let dir = std::env::temp_dir().join(format!(
+            "jetort_trt_reuse_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Minimal non-empty .engine so has_cached_trt_engine succeeds (size > 1KB).
+        std::fs::write(dir.join("model.engine"), vec![0u8; 2048]).unwrap();
+        let stored = TrtCacheManifest {
+            onnx_sha256: "abc".to_string(),
+            tensorrt_version: "10.0".to_string(),
+            cuda_version: "12.4".to_string(),
+            driver_version: "550".to_string(),
+            compute_capability: "8.7".to_string(),
+            precision: "FP16".to_string(),
+            profile_shapes: "min=input_ids:1x1;max=input_ids:4x512".to_string(),
+        };
+        super::write_trt_manifest(dir.to_str().unwrap(), &stored).unwrap();
+        let mut current = stored.clone();
+        // Default formula now prefers 4x2048 — must still reuse the on-disk engine.
+        current.profile_shapes = "min=input_ids:1x1;max=input_ids:4x2048".to_string();
+        assert!(trt_cache_is_current(dir.to_str().unwrap(), &current));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_position_ids_profile_is_config_bug_not_corrupt_engine() {
+        let err = "TensorRT cache deserialize failed (User needs to provide all the dynamic shape inputs with associated profiles ... Following input(s) has no associated shape profiles provided: position_ids)";
+        assert!(is_missing_trt_shape_profile_error(err));
+        assert!(!is_corrupt_trt_engine_error(err));
+        assert!(is_corrupt_trt_engine_error(
+            "failed to deserialize cuda engine: incompatible TensorRT version"
+        ));
+    }
+
+    #[test]
+    fn cached_profile_builder_covers_position_ids() {
+        let bounds = TrtProfileBounds {
+            min_batch: 1,
+            max_batch: 4,
+            min_seq: 1,
+            max_seq: 512,
+            opt_batch: 1,
+            opt_seq: 256,
+        };
+        let profiles = profiles_for_bounds(bounds);
+        assert!(profiles.max_shapes.contains("input_ids:4x512"));
+        assert!(profiles.max_shapes.contains("attention_mask:4x512"));
+        assert!(profiles.max_shapes.contains("position_ids:4x512"));
+        assert!(profiles.min_shapes.contains("position_ids:1x1"));
     }
 }

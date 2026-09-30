@@ -1,5 +1,8 @@
-use crate::config::{AppConfig, ModelConfig};
-use crate::engine::session::{resolve_model_and_tokenizer_path, ModelSession};
+use crate::config::{AppConfig, EngineKind, ModelConfig};
+use crate::engine::header_prober::{
+    builtin_alias_matches, engine_label, probe_model_bundle, resolve_model_task, ModelTask,
+};
+use crate::engine::session::{inspect_or_fallback, resolve_model_and_tokenizer_path, ModelSession};
 use crate::error::AppError;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -47,6 +50,8 @@ struct ModelEntry {
     last_access: AtomicU64,
     load_generation: AtomicU64,
     estimated_memory_mb: usize,
+    task: ModelTask,
+    engine_kind: EngineKind,
 }
 
 impl ModelEntry {
@@ -72,6 +77,7 @@ impl ModelEntry {
                 file_mb.saturating_mul(3) / 2 + 256
             })
             .unwrap_or(512);
+        let (task, engine_kind) = classify_configured_model(&config);
         Self {
             config,
             runtime: Mutex::new(ModelRuntime {
@@ -83,8 +89,27 @@ impl ModelEntry {
             last_access: AtomicU64::new(now_millis()),
             load_generation: AtomicU64::new(0),
             estimated_memory_mb,
+            task,
+            engine_kind,
         }
     }
+}
+
+fn classify_configured_model(config: &ModelConfig) -> (ModelTask, EngineKind) {
+    let Ok((path, _)) = resolve_model_and_tokenizer_path(config) else {
+        return (
+            resolve_model_task(None, config.alias.as_deref(), false),
+            EngineKind::OneShot,
+        );
+    };
+    let inspection = inspect_or_fallback(&path, config);
+    let probe = probe_model_bundle(&path, Some(&inspection), config.engine_kind);
+    let task = resolve_model_task(
+        Some(&inspection),
+        config.alias.as_deref(),
+        probe.has_audio_encoder,
+    );
+    (task, probe.kind)
 }
 
 pub struct ModelLease {
@@ -125,6 +150,8 @@ pub struct ModelStatus {
     pub load_on_startup: bool,
     pub estimated_memory_mb: usize,
     pub provider: Option<String>,
+    pub precision: Option<String>,
+    pub engine: String,
     pub error: Option<String>,
 }
 
@@ -230,44 +257,12 @@ impl ModelRegistry {
         if (name.is_empty() || name == "default" || name == "auto") && entries.len() == 1 {
             return entries.values().next().cloned();
         }
-        if name.eq_ignore_ascii_case("whisper-1") || name.eq_ignore_ascii_case("whisper") {
-            if let Some(entry) = entries.values().find(|entry| {
-                entry
-                    .runtime
-                    .lock()
-                    .expect("model runtime poisoned")
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| {
-                        session.inputs_metadata().iter().any(|input| {
-                            input.name == "features"
-                                || input.name == "speech"
-                                || (input.shape.len() == 3
-                                    && input.shape.last().copied() == Some(80))
-                        })
-                    })
-            }) {
-                return Some(entry.clone());
-            }
-        }
-        if name.starts_with("text-embedding-") {
-            if let Some(entry) = entries.values().find(|entry| {
-                entry
-                    .runtime
-                    .lock()
-                    .expect("model runtime poisoned")
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| {
-                        session.outputs_metadata().iter().any(|output| {
-                            output.name == "sentence_embedding"
-                                || output.name == "last_hidden_state"
-                                || output.shape.len() == 2
-                        })
-                    })
-            }) {
-                return Some(entry.clone());
-            }
+        if let Some(entry) = entries
+            .values()
+            .find(|entry| builtin_alias_matches(name, entry.task))
+            .cloned()
+        {
+            return Some(entry);
         }
         if name.eq_ignore_ascii_case("jev-latest")
             || name.eq_ignore_ascii_case("jev-preview")
@@ -348,7 +343,8 @@ impl ModelRegistry {
                 state = %unavailable_state,
                 "model not resident; loading on demand before serving request"
             );
-            self.load_entry_inner(entry.config.name.clone(), true).await?;
+            self.load_entry_inner(entry.config.name.clone(), true)
+                .await?;
 
             let session = {
                 let runtime = entry.runtime.lock().expect("model runtime poisoned");
@@ -464,8 +460,11 @@ impl ModelRegistry {
             }
             Err(error) => {
                 let mut runtime = entry.runtime.lock().expect("model runtime poisoned");
+                runtime.session.take();
                 runtime.state = ModelState::Failed;
                 runtime.load_error = Some(error.to_string());
+                drop(runtime);
+                crate::engine::memory::trim_allocator_heap();
                 Err(error)
             }
         }
@@ -603,6 +602,11 @@ impl ModelRegistry {
                         .session
                         .as_ref()
                         .map(|session| session.active_provider().to_string()),
+                    precision: runtime
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.precision().map(|value| value.to_string())),
+                    engine: engine_label(entry.engine_kind).to_string(),
                     error: runtime.load_error.clone(),
                 }
             })
@@ -656,12 +660,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_non_preloaded_model_is_discoverable_but_unavailable() {
+    async fn arch_load_on_first_use_failure_is_not_loaded() {
         let config: AppConfig = serde_yaml::from_str(
             r#"
 models:
   - name: lazy-model
     path: /nonexistent/model.onnx
+    load_on_startup: false
+  - name: embed
+    alias: text-embedding-3-small
+    path: /nonexistent/embed.onnx
+    load_on_startup: false
+  - name: asr
+    path: /nonexistent/asr.onnx
     load_on_startup: false
 "#,
         )
@@ -670,19 +681,35 @@ models:
         registry.init_from_config(&config).await;
 
         let statuses = registry.model_statuses().await;
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].state, ModelState::Unloaded);
+        assert!(statuses
+            .iter()
+            .all(|status| status.state == ModelState::Unloaded));
 
         let error = match registry.acquire_model("lazy-model").await {
-            Ok(_) => panic!("unloaded model unexpectedly acquired"),
+            Ok(_) => panic!("failed load must not return a session"),
             Err(error) => error,
         };
-        assert!(matches!(
+        assert!(!matches!(
             error,
-            AppError::ModelNotLoaded {
-                state,
-                ..
-            } if state == "loading"
+            AppError::ModelNotLoaded { ref state, .. } if state == "loading"
         ));
+        let statuses = registry.model_statuses().await;
+        let lazy = statuses
+            .iter()
+            .find(|status| status.name == "lazy-model")
+            .unwrap();
+        assert_eq!(lazy.state, ModelState::Failed);
+        assert!(lazy.provider.is_none());
+
+        let matched = match registry.acquire_model("text-embedding-ada-002").await {
+            Ok(_) => panic!("alias match must not mark a missing model loaded"),
+            Err(error) => error,
+        };
+        let message = matched.to_string();
+        assert!(message.contains("embed") || message.contains("does not exist"));
+        assert!(registry.acquire_model("whisper-1").await.is_err());
+        let statuses = registry.model_statuses().await;
+        let asr = statuses.iter().find(|status| status.name == "asr").unwrap();
+        assert_eq!(asr.state, ModelState::Unloaded);
     }
 }

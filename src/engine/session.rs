@@ -1,14 +1,20 @@
 use crate::config::ModelConfig;
 use crate::engine::provider::{
-    configure_builder_for_provider, configure_builder_for_provider_with_precision,
-    detect_model_precision, get_candidate_providers, sanitize_einsum_equations,
+    applied_trt_profiles, configure_builder_for_provider,
+    configure_builder_for_provider_with_precision, current_trt_manifest, detect_model_precision,
+    get_candidate_providers, has_cached_trt_engine, is_corrupt_trt_engine_error,
+    is_missing_trt_shape_profile_error, quarantine_trt_cache, sanitize_einsum_equations,
+    trt_cache_dir, trt_profile_signature_from_shapes, trt_runtime_profile_bounds,
+    write_trt_manifest,
 };
+use crate::engine::provider_chain::{self, FallbackReason, ShapeRoute, TrtProfileBounds};
 use crate::error::AppError;
 use crate::protocol::kserve_v2::TensorMetadata;
 use half::f16;
 use ort::session::builder::{GraphOptimizationLevel, SessionBuilder};
 use ort::session::Session;
 use ort::value::{DynValue, Tensor, ValueType};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
@@ -222,6 +228,17 @@ pub fn find_local_tokenizer_file(dir: &std::path::Path) -> Option<std::path::Pat
                     let p = path.join(name);
                     if p.is_file() {
                         return Some(p);
+                    }
+                }
+                // RLAgent bundles keep the HF tokenizer at `<model>/tokenizer` or
+                // `<model>/source/tokenizer` (AutoTokenizer.from_pretrained).
+                let nested = path.join("tokenizer");
+                if nested.is_dir() {
+                    for name in &priority_names {
+                        let p = nested.join(name);
+                        if p.is_file() {
+                            return Some(p);
+                        }
                     }
                 }
             }
@@ -499,6 +516,7 @@ pub struct OneShotSession {
     pub aliases: Vec<String>,
     pub pool: crate::engine::session_pool::SessionPool,
     pub active_provider: String,
+    pub precision: Option<String>,
     pub inputs_metadata: Vec<TensorMetadata>,
     pub outputs_metadata: Vec<TensorMetadata>,
     pub tokenizer: Option<Tokenizer>,
@@ -510,6 +528,15 @@ pub struct OneShotSession {
     pub n_ctx: usize,
     pub n_batch: usize,
     pub model_path: std::path::PathBuf,
+    /// ONNX file the primary pool was committed from (may be a sanitized cache copy).
+    effective_onnx_path: std::path::PathBuf,
+    /// Config snapshot used to lazily build the next-provider session for
+    /// requests whose shapes exceed the active TensorRT profile.
+    model_config: ModelConfig,
+    /// Bounds of the loaded TensorRT engine profile (None when not on TensorRT).
+    pub trt_profile: Option<TrtProfileBounds>,
+    /// Lazily created next-backend pool (CUDA then CPU) for over-profile shapes.
+    fallback_pool: Mutex<Option<(String, crate::engine::session_pool::SessionPool)>>,
     pub decision_temperatures: Option<DecisionTemperatures>,
     pub openjev: Option<OpenJevCalibration>,
 }
@@ -629,8 +656,14 @@ impl OneShotSession {
         );
 
         let mut session_opt = None;
-        let mut active_provider = "CPU".to_string();
+        let mut active_provider = provider_chain::Backend::Cpu.canonical_name().to_string();
+        let mut active_precision: Option<String> = None;
         let mut last_err = None;
+        let mut trt_cache_retried = false;
+        let selection = provider_chain::selection_plan(&config.providers);
+        for warning in &selection.fallback_warnings {
+            warn!(model = %config.name, "{warning}");
+        }
 
         let create_base_builder = |cfg: &ModelConfig| -> Result<SessionBuilder, String> {
             let mut builder = Session::builder()
@@ -688,12 +721,15 @@ impl OneShotSession {
                 if !feasible {
                     let next_provider = candidate_providers.get(idx + 1);
                     if let Some(next) = next_provider {
-                        info!(
+                        let line = FallbackReason::DeviceMissing {
+                            detail: reason.clone(),
+                        }
+                        .warning_line(&provider_chain::canonical_provider_name(next));
+                        warn!(
                             model = %config.name,
                             reason = %reason,
-                            fallback_to = %next,
-                            "⚡ TensorRT cold compilation pre-flight skipped: {}. Proactively falling back to '{}' (priority {})...",
-                            reason, next, idx + 2
+                            fallback_to = %provider_chain::canonical_provider_name(next),
+                            "{line}"
                         );
                     } else {
                         info!(
@@ -710,7 +746,8 @@ impl OneShotSession {
                 // NOTE on Jetson UMA architecture: We do NOT attempt serial cold builds of different precisions
                 // in the same process loop, because each failed TensorRT engine compilation retains workspace
                 // and optimizer scratch in device memory until process exit, rapidly leading to OOM crash.
-                // If the detected precision fails on TensorRT, we cleanly drop builder, trim heap, and fallback to CUDA/CPU.
+                // A failed startup build drops the builder, trims the heap, and
+                // lets this load attempt continue down the provider chain.
                 let target_precision = detected_precision;
 
                 info!(
@@ -792,14 +829,37 @@ impl OneShotSession {
                     Ok(sess) => {
                         info!(
                             model = %config.name,
-                            provider = %provider_name,
+                            provider = provider_chain::Backend::TensorRt.canonical_name(),
                             precision = %target_precision,
                             priority = idx + 1,
-                            "✨ Model successfully initialized and active on provider 'TensorRT' ({})",
-                            target_precision
+                            "✨ Model successfully initialized and active on provider 'TensorRT'"
                         );
                         session_opt = Some(sess);
-                        active_provider = format!("TensorRT ({})", target_precision);
+                        active_provider = provider_chain::Backend::TensorRt
+                            .canonical_name()
+                            .to_string();
+                        active_precision = Some(target_precision.to_string());
+                        let cache_dir = trt_cache_dir(config);
+                        let applied =
+                            applied_trt_profiles(config, &cache_dir, Some(&effective_model_path));
+                        let profile_sig = trt_profile_signature_from_shapes(
+                            &applied.min_shapes,
+                            &applied.opt_shapes,
+                            &applied.max_shapes,
+                        );
+                        if let Some(manifest) = current_trt_manifest(
+                            &effective_model_path,
+                            &target_precision.to_string(),
+                            &profile_sig,
+                        ) {
+                            if let Err(err) = write_trt_manifest(&cache_dir, &manifest) {
+                                warn!(
+                                    model = %config.name,
+                                    error = %err,
+                                    "Failed to write TensorRT cache manifest"
+                                );
+                            }
+                        }
                         break;
                     }
                     Err(e) => {
@@ -807,15 +867,200 @@ impl OneShotSession {
                         drop(configured_builder);
                         crate::engine::memory::trim_allocator_heap();
 
+                        let cache_dir = trt_cache_dir(config);
+                        let err_text = e.to_string();
+
+                        // Missing EP shape profiles is a session-config bug, not a bad engine.
+                        // Keep the cache, rebuild options (applied_trt_profiles covers all ONNX
+                        // inputs), and retry the SAME engine once. Never quarantine for this.
+                        if !trt_cache_retried
+                            && has_cached_trt_engine(&cache_dir)
+                            && is_missing_trt_shape_profile_error(&err_text)
+                        {
+                            trt_cache_retried = true;
+                            warn!(
+                                model = %config.name,
+                                provider = "TensorRT",
+                                error = %err_text,
+                                "⚠️ TensorRT session create failed: EP options omitted a dynamic input profile; retrying SAME cache with complete profiles (engine not quarantined)"
+                            );
+                            let mut retry_builder =
+                                match create_base_builder(config).and_then(|b| {
+                                    configure_builder_for_provider_with_precision(
+                                        b,
+                                        config,
+                                        provider_name,
+                                        target_precision,
+                                        Some(&effective_model_path),
+                                    )
+                                    .map_err(|err| err.to_string())
+                                }) {
+                                    Ok(builder) => builder,
+                                    Err(err) => {
+                                        last_err = Some(err);
+                                        continue;
+                                    }
+                                };
+                            match retry_builder.commit_from_file(&effective_model_path) {
+                                Ok(sess) => {
+                                    info!(
+                                        model = %config.name,
+                                        provider = provider_chain::Backend::TensorRt.canonical_name(),
+                                        precision = %target_precision,
+                                        "✨ Model successfully initialized and active on provider 'TensorRT' (cache reused after profile-option fix)"
+                                    );
+                                    session_opt = Some(sess);
+                                    active_provider = provider_chain::Backend::TensorRt
+                                        .canonical_name()
+                                        .to_string();
+                                    active_precision = Some(target_precision.to_string());
+                                    if let Some(manifest) = {
+                                        let applied = applied_trt_profiles(
+                                            config,
+                                            &cache_dir,
+                                            Some(&effective_model_path),
+                                        );
+                                        let profile_sig = trt_profile_signature_from_shapes(
+                                            &applied.min_shapes,
+                                            &applied.opt_shapes,
+                                            &applied.max_shapes,
+                                        );
+                                        current_trt_manifest(
+                                            &effective_model_path,
+                                            &target_precision.to_string(),
+                                            &profile_sig,
+                                        )
+                                    } {
+                                        let _ = write_trt_manifest(&cache_dir, &manifest);
+                                    }
+                                    break;
+                                }
+                                Err(retry_err) => {
+                                    crate::engine::memory::trim_allocator_heap();
+                                    last_err = Some(format!(
+                                        "TensorRT profile-option retry failed: {retry_err}"
+                                    ));
+                                    // Fall through to CUDA/CPU — do not quarantine a good engine.
+                                    if let Some(next) = candidate_providers.get(idx + 1) {
+                                        let line = provider_chain::classify_provider_failure(
+                                            &retry_err.to_string(),
+                                        )
+                                        .warning_line(&provider_chain::canonical_provider_name(
+                                            next,
+                                        ));
+                                        warn!(model = %config.name, "{line}");
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Only quarantine when the engine file itself looks corrupt / incompatible.
+                        if !trt_cache_retried
+                            && has_cached_trt_engine(&cache_dir)
+                            && is_corrupt_trt_engine_error(&err_text)
+                        {
+                            trt_cache_retried = true;
+                            match quarantine_trt_cache(&cache_dir) {
+                                Ok(dest) => {
+                                    warn!(
+                                        model = %config.name,
+                                        provider = "TensorRT",
+                                        quarantine = %dest.display(),
+                                        error = %err_text,
+                                        "⚠️ TensorRT engine deserialize failed (corrupt/incompatible cache); quarantined and recompiling once — this is not a fallback to TensorRT"
+                                    );
+                                }
+                                Err(qerr) => {
+                                    warn!(
+                                        model = %config.name,
+                                        error = %qerr,
+                                        "Failed to quarantine TensorRT cache after deserialize error"
+                                    );
+                                }
+                            }
+                            // Rebuild once against an empty cache before leaving TensorRT.
+                            let mut retry_builder =
+                                match create_base_builder(config).and_then(|b| {
+                                    configure_builder_for_provider_with_precision(
+                                        b,
+                                        config,
+                                        provider_name,
+                                        target_precision,
+                                        Some(&effective_model_path),
+                                    )
+                                    .map_err(|err| err.to_string())
+                                }) {
+                                    Ok(builder) => builder,
+                                    Err(err) => {
+                                        last_err = Some(err);
+                                        continue;
+                                    }
+                                };
+                            match retry_builder.commit_from_file(&effective_model_path) {
+                                Ok(sess) => {
+                                    info!(
+                                        model = %config.name,
+                                        provider = provider_chain::Backend::TensorRt.canonical_name(),
+                                        precision = %target_precision,
+                                        "✨ Model successfully initialized and active on provider 'TensorRT'"
+                                    );
+                                    session_opt = Some(sess);
+                                    active_provider = provider_chain::Backend::TensorRt
+                                        .canonical_name()
+                                        .to_string();
+                                    active_precision = Some(target_precision.to_string());
+                                    if let Some(manifest) = {
+                                        let cache_dir = trt_cache_dir(config);
+                                        let applied = applied_trt_profiles(
+                                            config,
+                                            &cache_dir,
+                                            Some(&effective_model_path),
+                                        );
+                                        let profile_sig = trt_profile_signature_from_shapes(
+                                            &applied.min_shapes,
+                                            &applied.opt_shapes,
+                                            &applied.max_shapes,
+                                        );
+                                        current_trt_manifest(
+                                            &effective_model_path,
+                                            &target_precision.to_string(),
+                                            &profile_sig,
+                                        )
+                                    } {
+                                        let _ =
+                                            write_trt_manifest(&trt_cache_dir(config), &manifest);
+                                    }
+                                    break;
+                                }
+                                Err(retry_err) => {
+                                    crate::engine::memory::trim_allocator_heap();
+                                    last_err =
+                                        Some(format!("TensorRT recompile failed: {retry_err}"));
+                                    if let Some(next) = candidate_providers.get(idx + 1) {
+                                        let line = FallbackReason::SessionCreateFailed {
+                                            detail: retry_err.to_string(),
+                                        }
+                                        .warning_line(&provider_chain::canonical_provider_name(
+                                            next,
+                                        ));
+                                        warn!(model = %config.name, "{line}");
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         let next_provider = candidate_providers.get(idx + 1);
                         if let Some(next) = next_provider {
+                            let line = provider_chain::classify_provider_failure(&err_text)
+                                .warning_line(&provider_chain::canonical_provider_name(next));
                             warn!(
                                 model = %config.name,
                                 failed_precision = %target_precision,
-                                fallback_to = %next,
+                                fallback_to = %provider_chain::canonical_provider_name(next),
                                 error = %e,
-                                "⚠️ TensorRT ({}) build failed for model '{}'. Fallback reason: {}. Falling back to runtime provider '{}' (priority {})...",
-                                target_precision, config.name, e, next, idx + 2
+                                "{line}"
                             );
                         } else {
                             warn!(
@@ -874,22 +1119,23 @@ impl OneShotSession {
                         provider = %provider_name,
                         priority = idx + 1,
                         "✨ Model successfully initialized and active on provider '{}'",
-                        provider_name
+                        provider_chain::canonical_provider_name(provider_name)
                     );
                     session_opt = Some(sess);
-                    active_provider = provider_name.clone();
+                    active_provider = provider_chain::canonical_provider_name(provider_name);
                     break;
                 }
                 Err(e) => {
                     let next_provider = candidate_providers.get(idx + 1);
                     if let Some(next) = next_provider {
+                        let line = provider_chain::classify_provider_failure(&e.to_string())
+                            .warning_line(&provider_chain::canonical_provider_name(next));
                         warn!(
                             model = %config.name,
-                            failed_provider = %provider_name,
-                            fallback_to = %next,
+                            failed_provider = %provider_chain::canonical_provider_name(provider_name),
+                            fallback_to = %provider_chain::canonical_provider_name(next),
                             error = %e,
-                            "⚠️ Provider '{}' failed for model '{}'. Fallback reason: {}. Falling back to '{}' (priority {})...",
-                            provider_name, config.name, e, next, idx + 2
+                            "{line}"
                         );
                     } else {
                         warn!(
@@ -1037,9 +1283,7 @@ impl OneShotSession {
                 "Initializing additional sessions for session pool..."
             );
             for pool_idx in 1..pool_target {
-                let builder_res = if active_provider.to_lowercase() == "tensorrt"
-                    || active_provider.to_lowercase() == "trt"
-                {
+                let builder_res = if provider_chain::is_tensorrt_name(&active_provider) {
                     create_base_builder(config).and_then(|b| {
                         configure_builder_for_provider_with_precision(
                             b,
@@ -1134,7 +1378,7 @@ impl OneShotSession {
             }
         }
         if n_ctx_train == 0 {
-            n_ctx_train = config.pad_seq_len.unwrap_or(512);
+            n_ctx_train = 512;
         }
 
         let n_ctx = config.effective_n_ctx().unwrap_or(n_ctx_train);
@@ -1163,26 +1407,46 @@ impl OneShotSession {
             n_ctx_train, n_ctx, n_batch
         );
 
-        let semaphore_permits = config.concurrency_limit.unwrap_or(pool.capacity()).max(1);
+        let semaphore_permits = config.effective_concurrency();
         let inference_semaphore =
             std::sync::Arc::new(tokio::sync::Semaphore::new(semaphore_permits));
+
+        let trt_profile = if provider_chain::is_tensorrt_name(&active_provider) {
+            Some(trt_runtime_profile_bounds(&trt_cache_dir(config), config))
+        } else {
+            None
+        };
+        if let Some(profile) = trt_profile {
+            info!(
+                model = %config.name,
+                max_batch = profile.max_batch,
+                max_seq = profile.max_seq,
+                range = %profile.range_label(),
+                "TensorRT runtime profile bounds active"
+            );
+        }
 
         Ok(Self {
             name: config.name.clone(),
             aliases: config.alias.iter().cloned().collect(),
             pool,
             active_provider,
+            precision: active_precision,
             inputs_metadata,
             outputs_metadata,
             tokenizer,
             vocab_table,
-            pad_seq_len: config.pad_seq_len.or(Some(n_ctx)),
+            pad_seq_len: config.pad_seq_len,
             max_batch_size: config.max_batch_size,
             inference_semaphore,
             n_ctx_train,
             n_ctx,
             n_batch,
             model_path: resolved_model_path,
+            effective_onnx_path: effective_model_path,
+            model_config: config.clone(),
+            trt_profile,
+            fallback_pool: Mutex::new(None),
             decision_temperatures,
             openjev,
         })
@@ -1194,6 +1458,75 @@ impl OneShotSession {
             .acquire_owned()
             .await
             .map_err(|e| AppError::Internal(format!("Inference semaphore closed: {}", e)))
+    }
+
+    /// Lazily build the next backend after TensorRT (CUDA then CPU) for over-profile shapes.
+    fn ensure_fallback_pool(
+        &self,
+    ) -> Result<(String, crate::engine::session_pool::SessionPool), AppError> {
+        {
+            let guard = self.fallback_pool.lock();
+            if let Some((name, pool)) = guard.as_ref() {
+                return Ok((name.clone(), pool.clone()));
+            }
+        }
+        let plan = provider_chain::selection_plan(&self.model_config.providers);
+        let candidates: Vec<_> = plan
+            .walk
+            .into_iter()
+            .filter(|b| *b != provider_chain::Backend::TensorRt)
+            .collect();
+        let mut last_err = String::from("no fallback provider available");
+        for backend in candidates {
+            let name = backend.canonical_name().to_string();
+            let builder_res =
+                Session::builder()
+                    .map_err(|e| e.to_string())
+                    .and_then(|mut builder| {
+                        builder = builder
+                            .with_optimization_level(GraphOptimizationLevel::Level1)
+                            .map_err(|e| e.to_string())?;
+                        builder = builder
+                            .with_intra_threads(self.model_config.intra_threads)
+                            .map_err(|e| e.to_string())?;
+                        builder = builder
+                            .with_inter_threads(self.model_config.inter_threads)
+                            .map_err(|e| e.to_string())?;
+                        builder = builder
+                            .with_memory_pattern(self.model_config.enable_mem_pattern)
+                            .map_err(|e| e.to_string())?;
+                        configure_builder_for_provider(builder, &self.model_config, &name)
+                            .map_err(|e| e.to_string())
+                    });
+            match builder_res {
+                Ok(mut b) => match b.commit_from_file(&self.effective_onnx_path) {
+                    Ok(sess) => {
+                        let pool = crate::engine::session_pool::SessionPool::from_sessions(
+                            format!("{}-fallback-{}", self.name, name),
+                            vec![sess],
+                        );
+                        *self.fallback_pool.lock() = Some((name.clone(), pool.clone()));
+                        info!(
+                            model = %self.name,
+                            fallback = %name,
+                            "Created request-time fallback session pool for over-profile shapes"
+                        );
+                        return Ok((name, pool));
+                    }
+                    Err(e) => {
+                        last_err = format!("{name}: {e}");
+                        crate::engine::memory::trim_allocator_heap();
+                    }
+                },
+                Err(e) => {
+                    last_err = format!("{name}: {e}");
+                }
+            }
+        }
+        Err(AppError::Inference(format!(
+            "Failed to create TensorRT shape-fallback session for '{}': {last_err}",
+            self.name
+        )))
     }
 
     pub fn infer_raw(
@@ -1208,7 +1541,16 @@ impl OneShotSession {
         inputs: HashMap<String, DynValue>,
         target_outputs: Option<&[&str]>,
     ) -> Result<HashMap<String, DynValue>, AppError> {
-        let mut lock = self.pool.acquire();
+        self.infer_raw_on_pool(&self.pool, inputs, target_outputs)
+    }
+
+    fn infer_raw_on_pool(
+        &self,
+        pool: &crate::engine::session_pool::SessionPool,
+        inputs: HashMap<String, DynValue>,
+        target_outputs: Option<&[&str]>,
+    ) -> Result<HashMap<String, DynValue>, AppError> {
+        let mut lock = pool.acquire();
 
         let run_options = ort::session::RunOptions::new()
             .map_err(|e| AppError::Inference(format!("Failed to create RunOptions: {}", e)))?;
@@ -1227,8 +1569,6 @@ impl OneShotSession {
                 }
                 run_options.with_outputs(selector)
             } else {
-                // If requested targets do not match model's output names, fall back to default outputs
-                // while pruning unneeded generation KV cache tensors
                 let mut selector = ort::session::OutputSelector::default();
                 for m in &self.outputs_metadata {
                     if m.name.starts_with("present.") {
@@ -1238,7 +1578,6 @@ impl OneShotSession {
                 run_options.with_outputs(selector)
             }
         } else {
-            // Prune unneeded KV cache tensors (present.*) by default to eliminate memory leaks and fragmentation
             let mut selector = ort::session::OutputSelector::default();
             for m in &self.outputs_metadata {
                 if m.name.starts_with("present.") {
@@ -1262,7 +1601,6 @@ impl OneShotSession {
             }
         }
 
-        // If outputs_metadata was empty or missing keys, harvest all remaining outputs
         if result.is_empty() {
             for (name, val) in outputs {
                 result.insert(name.to_string(), val);
@@ -1563,7 +1901,11 @@ impl OneShotSession {
         Ok(input_map)
     }
 
-    pub fn embed_texts(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, usize), AppError> {
+    /// Returns `(embeddings, prompt_tokens, backend_that_ran)`.
+    pub fn embed_texts(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<(Vec<Vec<f32>>, usize, String), AppError> {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             AppError::Tokenizer(format!(
                 "Model '{}' does not have a configured tokenizer for embedding",
@@ -1572,7 +1914,7 @@ impl OneShotSession {
         })?;
 
         if texts.is_empty() {
-            return Ok((vec![], 0));
+            return Ok((vec![], 0, self.active_provider.clone()));
         }
 
         let all_encodings = tokenizer
@@ -1580,15 +1922,83 @@ impl OneShotSession {
             .map_err(|e| AppError::Tokenizer(format!("Tokenization error: {}", e)))?;
 
         let total_prompt_tokens: usize = all_encodings.iter().map(|e| e.get_ids().len()).sum();
-        let mut all_embeddings = Vec::with_capacity(all_encodings.len());
+        let max_seq_raw = all_encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(1);
         let max_batch_limit = self.max_batch_size.max(1);
-        let max_tile_bytes: usize = 32 * 1024 * 1024; // 32 MB budget to prevent Tegra nvmap allocation failure
+        let max_tile_bytes: usize = 32 * 1024 * 1024;
 
+        // One place decides TensorRT vs next backend from the loaded profile bounds.
+        let (run_provider, run_pool, microbatch_cap, profile_ref): (
+            String,
+            crate::engine::session_pool::SessionPool,
+            usize,
+            Option<TrtProfileBounds>,
+        ) = if provider_chain::is_tensorrt_name(&self.active_provider) {
+            if let Some(profile) = self.trt_profile {
+                match provider_chain::plan_shape_route(
+                    all_encodings.len().min(max_batch_limit).max(1),
+                    max_seq_raw.max(1),
+                    &profile,
+                ) {
+                    ShapeRoute::TensorRt { microbatch, .. } => (
+                        self.active_provider.clone(),
+                        self.pool.clone(),
+                        microbatch,
+                        Some(profile),
+                    ),
+                    ShapeRoute::Fallback {
+                        reason,
+                        actual_batch,
+                        actual_seq,
+                    } => {
+                        let (fb_name, fb_pool) = self.ensure_fallback_pool()?;
+                        let line = provider_chain::shape_fallback_warning(
+                            &fb_name,
+                            &format!(
+                                "actual=[{actual_batch},{actual_seq}] profile={} ({reason})",
+                                profile.range_label()
+                            ),
+                        );
+                        warn!(
+                            model = %self.name,
+                            target_backend = %fb_name,
+                            actual_batch,
+                            actual_seq,
+                            profile = %profile.range_label(),
+                            "{line}"
+                        );
+                        (fb_name, fb_pool, max_batch_limit, None)
+                    }
+                }
+            } else {
+                (
+                    self.active_provider.clone(),
+                    self.pool.clone(),
+                    max_batch_limit,
+                    None,
+                )
+            }
+        } else {
+            (
+                self.active_provider.clone(),
+                self.pool.clone(),
+                max_batch_limit,
+                self.trt_profile,
+            )
+        };
+
+        let mut all_embeddings = Vec::with_capacity(all_encodings.len());
         let mut current_chunk: Vec<&tokenizers::Encoding> = Vec::new();
         let mut current_max_len: usize = 0;
 
         let run_chunk = |chunk: &[&tokenizers::Encoding],
-                         embeddings_out: &mut Vec<Vec<f32>>|
+                         embeddings_out: &mut Vec<Vec<f32>>,
+                         provider: &str,
+                         pool: &crate::engine::session_pool::SessionPool,
+                         profile: Option<&TrtProfileBounds>|
          -> Result<(), AppError> {
             let batch_size = chunk.len();
             if batch_size == 0 {
@@ -1597,14 +2007,17 @@ impl OneShotSession {
 
             let max_len_in_chunk = chunk.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
             let aligned_len = max_len_in_chunk.div_ceil(8) * 8;
-            // Dynamically clamp sequence length so quadratic attention mask buffer (B * 16 * S^2 * 4) <= max_tile_bytes
             let max_safe_len = (((max_tile_bytes / (batch_size.max(1) * 16 * 4)) as f64).sqrt()
                 as usize)
                 .clamp(128, 512);
-            let effective_seq_len = match self.pad_seq_len {
-                Some(cap) => aligned_len.min(cap).max(8),
-                None => aligned_len.min(max_safe_len).max(8),
-            };
+            let effective_seq_len = provider_chain::resolve_seq_pad(
+                self.pad_seq_len,
+                provider,
+                aligned_len,
+                self.n_ctx,
+                max_safe_len,
+                profile,
+            );
 
             let mut input_ids = Vec::with_capacity(batch_size * effective_seq_len);
             let mut attention_mask = Vec::with_capacity(batch_size * effective_seq_len);
@@ -1633,8 +2046,8 @@ impl OneShotSession {
                 attention_mask,
             )?;
 
-            // Only request embedding outputs; prune unneeded branches (like 56 present.* KV caches)
-            let raw_outputs = self.infer_raw_with_targets(
+            let raw_outputs = self.infer_raw_on_pool(
+                pool,
                 input_map,
                 Some(&["sentence_embedding", "last_hidden_state"]),
             )?;
@@ -1669,7 +2082,6 @@ impl OneShotSession {
                 let hidden_dim = shape[2] as usize;
 
                 if out_seq_len == 1 {
-                    // Model already extracted a single pooled token (e.g. CLS representation)
                     for b in 0..batch_size.min(out_batch) {
                         let offset = b * hidden_dim;
                         if offset + hidden_dim <= data.len() {
@@ -1709,7 +2121,6 @@ impl OneShotSession {
                             }
                         }
 
-                        // L2 normalization
                         let norm: f32 = pooled.iter().map(|&x| x * x).sum::<f32>().sqrt();
                         if norm > 0.0 {
                             for h in 0..hidden_dim {
@@ -1746,21 +2157,32 @@ impl OneShotSession {
             Ok(())
         };
 
+        let batch_cap = microbatch_cap.min(max_batch_limit).max(1);
         for enc in &all_encodings {
             let enc_len = enc.get_ids().len();
             let cand_len = current_chunk.len() + 1;
             let cand_max = current_max_len.max(enc_len);
             let aligned = cand_max.div_ceil(8) * 8;
-            let cand_seq_len = match self.pad_seq_len {
-                Some(cap) => aligned.min(cap).max(8),
-                None => aligned.min(512).max(8),
-            };
+            let cand_seq_len = provider_chain::resolve_seq_pad(
+                self.pad_seq_len,
+                &run_provider,
+                aligned,
+                self.n_ctx,
+                512,
+                profile_ref.as_ref(),
+            );
             let cand_est_bytes = cand_len * 16 * cand_seq_len * cand_seq_len * 4;
 
             if !current_chunk.is_empty()
-                && (cand_len > max_batch_limit || cand_est_bytes > max_tile_bytes)
+                && (cand_len > batch_cap || cand_est_bytes > max_tile_bytes)
             {
-                run_chunk(&current_chunk, &mut all_embeddings)?;
+                run_chunk(
+                    &current_chunk,
+                    &mut all_embeddings,
+                    &run_provider,
+                    &run_pool,
+                    profile_ref.as_ref(),
+                )?;
                 current_chunk.clear();
                 current_max_len = 0;
             }
@@ -1770,17 +2192,24 @@ impl OneShotSession {
         }
 
         if !current_chunk.is_empty() {
-            run_chunk(&current_chunk, &mut all_embeddings)?;
+            run_chunk(
+                &current_chunk,
+                &mut all_embeddings,
+                &run_provider,
+                &run_pool,
+                profile_ref.as_ref(),
+            )?;
         }
 
-        Ok((all_embeddings, total_prompt_tokens))
+        Ok((all_embeddings, total_prompt_tokens, run_provider))
     }
 
+    /// Returns `(scores, prompt_tokens, backend_that_ran)`.
     pub fn rerank_documents(
         &self,
         query: &str,
         documents: &[String],
-    ) -> Result<(Vec<f32>, usize), AppError> {
+    ) -> Result<(Vec<f32>, usize, String), AppError> {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             AppError::Tokenizer(format!(
                 "Model '{}' does not have a configured tokenizer for reranking",
@@ -1789,7 +2218,7 @@ impl OneShotSession {
         })?;
 
         if documents.is_empty() {
-            return Ok((vec![], 0));
+            return Ok((vec![], 0, self.active_provider.clone()));
         }
 
         let pairs: Vec<(String, String)> = documents
@@ -1802,15 +2231,82 @@ impl OneShotSession {
             .map_err(|e| AppError::Tokenizer(format!("Tokenization error in rerank: {}", e)))?;
 
         let total_prompt_tokens: usize = all_encodings.iter().map(|e| e.get_ids().len()).sum();
+        let max_seq_raw = all_encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(1);
         let mut all_scores = Vec::with_capacity(all_encodings.len());
         let max_batch_limit = self.max_batch_size.max(1);
-        let max_tile_bytes: usize = 32 * 1024 * 1024; // 32 MB budget to prevent Tegra nvmap allocation failure
+        let max_tile_bytes: usize = 32 * 1024 * 1024;
+
+        let (run_provider, run_pool, microbatch_cap, profile_ref): (
+            String,
+            crate::engine::session_pool::SessionPool,
+            usize,
+            Option<TrtProfileBounds>,
+        ) = if provider_chain::is_tensorrt_name(&self.active_provider) {
+            if let Some(profile) = self.trt_profile {
+                match provider_chain::plan_shape_route(
+                    all_encodings.len().min(max_batch_limit).max(1),
+                    max_seq_raw.max(1),
+                    &profile,
+                ) {
+                    ShapeRoute::TensorRt { microbatch, .. } => (
+                        self.active_provider.clone(),
+                        self.pool.clone(),
+                        microbatch,
+                        Some(profile),
+                    ),
+                    ShapeRoute::Fallback {
+                        reason,
+                        actual_batch,
+                        actual_seq,
+                    } => {
+                        let (fb_name, fb_pool) = self.ensure_fallback_pool()?;
+                        let line = provider_chain::shape_fallback_warning(
+                            &fb_name,
+                            &format!(
+                                "actual=[{actual_batch},{actual_seq}] profile={} ({reason})",
+                                profile.range_label()
+                            ),
+                        );
+                        warn!(
+                            model = %self.name,
+                            target_backend = %fb_name,
+                            actual_batch,
+                            actual_seq,
+                            profile = %profile.range_label(),
+                            "{line}"
+                        );
+                        (fb_name, fb_pool, max_batch_limit, None)
+                    }
+                }
+            } else {
+                (
+                    self.active_provider.clone(),
+                    self.pool.clone(),
+                    max_batch_limit,
+                    None,
+                )
+            }
+        } else {
+            (
+                self.active_provider.clone(),
+                self.pool.clone(),
+                max_batch_limit,
+                self.trt_profile,
+            )
+        };
 
         let mut current_chunk: Vec<&tokenizers::Encoding> = Vec::new();
         let mut current_max_len: usize = 0;
 
         let run_chunk = |chunk: &[&tokenizers::Encoding],
-                         scores_out: &mut Vec<f32>|
+                         scores_out: &mut Vec<f32>,
+                         provider: &str,
+                         pool: &crate::engine::session_pool::SessionPool,
+                         profile: Option<&TrtProfileBounds>|
          -> Result<(), AppError> {
             let batch_size = chunk.len();
             if batch_size == 0 {
@@ -1819,14 +2315,17 @@ impl OneShotSession {
 
             let max_len_in_chunk = chunk.iter().map(|e| e.get_ids().len()).max().unwrap_or(1);
             let aligned_len = max_len_in_chunk.div_ceil(8) * 8;
-            // Dynamically clamp sequence length so quadratic attention mask buffer (B * 16 * S^2 * 4) <= max_tile_bytes
             let max_safe_len = (((max_tile_bytes / (batch_size.max(1) * 16 * 4)) as f64).sqrt()
                 as usize)
                 .clamp(128, 512);
-            let effective_seq_len = match self.pad_seq_len {
-                Some(cap) => aligned_len.min(cap).max(8),
-                None => aligned_len.min(max_safe_len).max(8),
-            };
+            let effective_seq_len = provider_chain::resolve_seq_pad(
+                self.pad_seq_len,
+                provider,
+                aligned_len,
+                self.n_ctx,
+                max_safe_len,
+                profile,
+            );
 
             let mut input_ids = Vec::with_capacity(batch_size * effective_seq_len);
             let mut attention_mask = Vec::with_capacity(batch_size * effective_seq_len);
@@ -1855,8 +2354,7 @@ impl OneShotSession {
                 attention_mask,
             )?;
 
-            // Only request logits for reranker; prune unneeded branches
-            let raw_outputs = self.infer_raw_with_targets(input_map, Some(&["logits"]))?;
+            let raw_outputs = self.infer_raw_on_pool(pool, input_map, Some(&["logits"]))?;
             let output_val = raw_outputs
                 .get("logits")
                 .or_else(|| {
@@ -1886,21 +2384,32 @@ impl OneShotSession {
             Ok(())
         };
 
+        let batch_cap = microbatch_cap.min(max_batch_limit).max(1);
         for enc in &all_encodings {
             let enc_len = enc.get_ids().len();
             let cand_len = current_chunk.len() + 1;
             let cand_max = current_max_len.max(enc_len);
             let aligned = cand_max.div_ceil(8) * 8;
-            let cand_seq_len = match self.pad_seq_len {
-                Some(cap) => aligned.min(cap).max(8),
-                None => aligned.min(512).max(8),
-            };
+            let cand_seq_len = provider_chain::resolve_seq_pad(
+                self.pad_seq_len,
+                &run_provider,
+                aligned,
+                self.n_ctx,
+                512,
+                profile_ref.as_ref(),
+            );
             let cand_est_bytes = cand_len * 16 * cand_seq_len * cand_seq_len * 4;
 
             if !current_chunk.is_empty()
-                && (cand_len > max_batch_limit || cand_est_bytes > max_tile_bytes)
+                && (cand_len > batch_cap || cand_est_bytes > max_tile_bytes)
             {
-                run_chunk(&current_chunk, &mut all_scores)?;
+                run_chunk(
+                    &current_chunk,
+                    &mut all_scores,
+                    &run_provider,
+                    &run_pool,
+                    profile_ref.as_ref(),
+                )?;
                 current_chunk.clear();
                 current_max_len = 0;
             }
@@ -1910,10 +2419,16 @@ impl OneShotSession {
         }
 
         if !current_chunk.is_empty() {
-            run_chunk(&current_chunk, &mut all_scores)?;
+            run_chunk(
+                &current_chunk,
+                &mut all_scores,
+                &run_provider,
+                &run_pool,
+                profile_ref.as_ref(),
+            )?;
         }
 
-        Ok((all_scores, total_prompt_tokens))
+        Ok((all_scores, total_prompt_tokens, run_provider))
     }
 
     pub fn supports_system_one(&self) -> bool {
@@ -2067,7 +2582,10 @@ impl OneShotSession {
     pub fn system_one_openjev(
         &self,
         state: &serde_json::Value,
-        questions: &std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneQuestion>,
+        questions: &std::collections::BTreeMap<
+            String,
+            crate::protocol::system_one::SystemOneQuestion,
+        >,
     ) -> Result<
         (
             std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneAnswer>,
@@ -2117,7 +2635,9 @@ impl OneShotSession {
             tokenizer
                 .encode(text, false)
                 .map(|encoding| encoding.get_ids().to_vec())
-                .map_err(|error| AppError::Tokenizer(format!("OpenJev tokenization failed: {error}")))
+                .map_err(|error| {
+                    AppError::Tokenizer(format!("OpenJev tokenization failed: {error}"))
+                })
         };
         let sanitize = |text: &str| text.replace(mask_token_str, " ");
         let state_text = sanitize(&s1::entry_text(state));
@@ -2240,9 +2760,12 @@ impl OneShotSession {
             );
 
             let outputs = self.infer_raw_with_targets(input_map, Some(&["logits"]))?;
-            let output = outputs.get("logits").or_else(|| outputs.values().next()).ok_or_else(|| {
-                AppError::Inference("OpenJev System One model produced no logits".to_string())
-            })?;
+            let output = outputs
+                .get("logits")
+                .or_else(|| outputs.values().next())
+                .ok_or_else(|| {
+                    AppError::Inference("OpenJev System One model produced no logits".to_string())
+                })?;
             let (shape, logits): (Vec<i64>, Vec<f32>) =
                 if let Ok((shape, values)) = output.try_extract_tensor::<f32>() {
                     (shape.to_vec(), values.to_vec())
@@ -2466,14 +2989,9 @@ fn load_vocab_json(path: &std::path::Path) -> Option<HashMap<u32, String>> {
     None
 }
 
-pub use crate::engine::genai::GenAiSession;
-use crate::engine::hybrid::HybridSession;
-
-/// Dual-Core Model Engine dispatching between One-Shot, GenAI, and Hybrid executions
-pub enum ModelEngine {
-    OneShot(std::sync::Arc<OneShotSession>),
-    GenAi(std::sync::Arc<GenAiSession>),
-    Hybrid(std::sync::Arc<HybridSession>),
+/// Single-pass ONNX session. Autoregressive graphs are refused in [`ModelEngine::load`].
+pub struct ModelEngine {
+    session: std::sync::Arc<OneShotSession>,
 }
 
 /// Backward-compatible alias for ModelSession
@@ -2489,143 +3007,80 @@ impl ModelEngine {
         let probe = crate::engine::header_prober::probe_model_bundle(
             &resolved_model_path,
             Some(&inspection),
+            config.engine_kind,
         );
         info!(
             model = %config.name,
-            paradigm = %probe.paradigm,
+            engine_kind = %probe.kind,
             reason = %probe.detection_reason,
-            "Classified model paradigm via HeaderProber"
+            "Classified model engine"
         );
 
-        match probe.paradigm {
-            crate::engine::header_prober::ModelParadigm::OneShot => {
+        match probe.kind {
+            crate::config::EngineKind::OneShot => {
                 let oneshot = OneShotSession::load_with_inspection(
                     config,
                     resolved_model_path,
                     inferred_tokenizer_path,
                     inspection,
                 )?;
-                Ok(ModelEngine::OneShot(std::sync::Arc::new(oneshot)))
+                Ok(ModelEngine {
+                    session: std::sync::Arc::new(oneshot),
+                })
             }
-            crate::engine::header_prober::ModelParadigm::AutoregressiveGenAi => {
-                let genai = GenAiSession::load(
-                    config,
-                    resolved_model_path,
-                    inferred_tokenizer_path,
-                    inspection,
-                )?;
-                Ok(ModelEngine::GenAi(std::sync::Arc::new(genai)))
-            }
-            crate::engine::header_prober::ModelParadigm::Hybrid => {
-                let hybrid = HybridSession::load(
-                    config,
-                    resolved_model_path,
-                    inferred_tokenizer_path,
-                    inspection,
-                )?;
-                Ok(ModelEngine::Hybrid(std::sync::Arc::new(hybrid)))
-            }
+            crate::config::EngineKind::Autoregressive => Err(AppError::InvalidInput(format!(
+                "Model '{}' is autoregressive ({}) and JetOrt only runs single-pass ONNX models. Refusing to load.",
+                config.name, probe.detection_reason
+            ))),
         }
     }
 
     pub fn name(&self) -> &str {
-        match self {
-            ModelEngine::OneShot(s) => &s.name,
-            ModelEngine::GenAi(s) => &s.name,
-            ModelEngine::Hybrid(s) => &s.name,
-        }
+        &self.session.name
     }
 
     pub fn aliases(&self) -> &[String] {
-        match self {
-            ModelEngine::OneShot(s) => &s.aliases,
-            ModelEngine::GenAi(s) => &s.aliases,
-            ModelEngine::Hybrid(s) => &s.aliases,
-        }
+        &self.session.aliases
     }
 
     pub fn active_provider(&self) -> &str {
-        match self {
-            ModelEngine::OneShot(s) => &s.active_provider,
-            ModelEngine::GenAi(s) => &s.active_provider,
-            ModelEngine::Hybrid(s) => s.active_provider(),
-        }
+        &self.session.active_provider
+    }
+
+    pub fn precision(&self) -> Option<&str> {
+        self.session.precision.as_deref()
     }
 
     pub fn inputs_metadata(&self) -> &[TensorMetadata] {
-        match self {
-            ModelEngine::OneShot(s) => &s.inputs_metadata,
-            ModelEngine::GenAi(s) => &s.inputs_metadata,
-            ModelEngine::Hybrid(s) => s.inputs_metadata(),
-        }
+        &self.session.inputs_metadata
     }
 
     pub fn outputs_metadata(&self) -> &[TensorMetadata] {
-        match self {
-            ModelEngine::OneShot(s) => &s.outputs_metadata,
-            ModelEngine::GenAi(s) => &s.outputs_metadata,
-            ModelEngine::Hybrid(s) => s.outputs_metadata(),
-        }
+        &self.session.outputs_metadata
     }
 
     pub fn as_oneshot(&self) -> Result<&std::sync::Arc<OneShotSession>, AppError> {
-        match self {
-            ModelEngine::OneShot(s) => Ok(s),
-            ModelEngine::Hybrid(s) => Err(AppError::InvalidInput(format!(
-                "Model '{}' is a Hybrid multimodal model driven entirely by ORT-GenAI (encoder+embedding+decoder \
-                 are all fused inside the GenAI model); it does not expose a standalone One-Shot tensor endpoint",
-                s.name
-            ))),
-            ModelEngine::GenAi(s) => Err(AppError::InvalidInput(format!(
-                "Model '{}' is an Autoregressive GenAI model; it does not support One-Shot tensor endpoints",
-                s.name
-            ))),
-        }
+        Ok(&self.session)
     }
 
-    pub fn as_genai(&self) -> Result<&std::sync::Arc<GenAiSession>, AppError> {
-        match self {
-            ModelEngine::GenAi(s) => Ok(s),
-            ModelEngine::Hybrid(s) => Ok(&s.backbone),
-            ModelEngine::OneShot(s) => Err(AppError::InvalidInput(format!(
-                "Model '{}' is a One-Shot forward model; it does not support Autoregressive GenAI endpoints",
-                s.name
-            ))),
-        }
-    }
-
-    pub fn as_hybrid(&self) -> Result<&std::sync::Arc<HybridSession>, AppError> {
-        match self {
-            ModelEngine::Hybrid(s) => Ok(s),
-            _ => Err(AppError::InvalidInput(format!(
-                "Model '{}' is not a Hybrid multimodal model",
-                self.name()
-            ))),
-        }
+    pub fn accepts_audio(&self) -> bool {
+        self.session.inputs_metadata.iter().any(|input| {
+            input.name == "features"
+                || input.name == "speech"
+                || (input.shape.len() == 3 && input.shape.last().copied() == Some(80))
+        })
     }
 
     pub fn pad_seq_len(&self) -> Option<usize> {
-        match self {
-            ModelEngine::OneShot(s) => s.pad_seq_len,
-            ModelEngine::GenAi(_) => None,
-            ModelEngine::Hybrid(_) => None,
-        }
+        self.session.pad_seq_len
     }
 
     pub fn n_ctx(&self) -> Option<usize> {
-        match self {
-            ModelEngine::GenAi(s) => Some(s.n_ctx),
-            ModelEngine::OneShot(s) => Some(s.n_ctx),
-            ModelEngine::Hybrid(s) => Some(s.backbone.n_ctx),
-        }
+        Some(self.session.n_ctx)
     }
 
     pub fn model_path(&self) -> &std::path::Path {
-        match self {
-            ModelEngine::OneShot(session) => &session.model_path,
-            ModelEngine::GenAi(session) => &session.model_path,
-            ModelEngine::Hybrid(session) => &session.backbone.model_path,
-        }
+        &self.session.model_path
     }
 
     pub fn created_at(&self) -> u64 {
@@ -2646,71 +3101,52 @@ impl ModelEngine {
     }
 
     pub fn engine_name(&self) -> &'static str {
-        match self {
-            ModelEngine::OneShot(_) => "onnxruntime",
-            ModelEngine::GenAi(_) => "onnxruntime-genai",
-            ModelEngine::Hybrid(_) => "hybrid",
-        }
+        "onnxruntime"
     }
 
     pub fn supports_system_one(&self) -> bool {
-        matches!(self, ModelEngine::OneShot(session) if session.supports_system_one())
+        self.session.supports_system_one()
     }
 
     pub fn supported_endpoints(&self) -> Vec<String> {
+        let session = &self.session;
         let mut endpoints = Vec::new();
-        match self {
-            ModelEngine::GenAi(_) => {
-                endpoints.push("/v1/chat/completions".to_string());
+        if session.supports_system_one() {
+            endpoints.push("/v1/systemone".to_string());
+        } else {
+            if session.outputs_metadata.iter().any(|output| {
+                output.name == "sentence_embedding" || output.name == "last_hidden_state"
+            }) {
+                endpoints.push("/v1/embeddings".to_string());
             }
-            ModelEngine::Hybrid(_) => {
-                endpoints.push(format!("/v2/models/{}/infer", self.name()));
-                endpoints.push("/v1/chat/completions".to_string());
+            if session
+                .outputs_metadata
+                .iter()
+                .any(|output| output.name == "logits")
+                && session.tokenizer.is_some()
+            {
+                endpoints.push("/v1/rerank".to_string());
             }
-            ModelEngine::OneShot(session) => {
-                endpoints.push(format!("/v2/models/{}/infer", self.name()));
-                if session.supports_system_one() {
-                    endpoints.push("/v1/systemone".to_string());
-                } else {
-                    if session.outputs_metadata.iter().any(|output| {
-                        output.name == "sentence_embedding" || output.name == "last_hidden_state"
-                    }) {
-                        endpoints.push("/v1/embeddings".to_string());
-                    }
-                    if session
-                        .outputs_metadata
-                        .iter()
-                        .any(|output| output.name == "logits")
-                        && session.tokenizer.is_some()
-                    {
-                        endpoints.push("/v1/rerank".to_string());
-                    }
-                }
-                if session.inputs_metadata.iter().any(|input| {
-                    input.name == "features"
-                        || input.name == "speech"
-                        || (input.shape.len() == 3 && input.shape.last().copied() == Some(80))
-                }) {
-                    endpoints.push("/v1/audio/transcriptions".to_string());
-                }
-            }
+        }
+        if session.inputs_metadata.iter().any(|input| {
+            input.name == "features"
+                || input.name == "speech"
+                || (input.shape.len() == 3 && input.shape.last().copied() == Some(80))
+        }) {
+            endpoints.push("/v1/audio/transcriptions".to_string());
         }
         endpoints
     }
 
     pub async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {
-        match self {
-            ModelEngine::OneShot(s) => s.acquire_permit().await,
-            ModelEngine::GenAi(s) => s.acquire_permit().await,
-            ModelEngine::Hybrid(s) => s.acquire_permit().await,
-        }
+        self.session.acquire_permit().await
     }
 
     pub fn infer_raw(
         &self,
         inputs: HashMap<String, DynValue>,
     ) -> Result<HashMap<String, DynValue>, AppError> {
-        self.as_oneshot()?.infer_raw(inputs)
+        self.session.infer_raw(inputs)
     }
 
     pub fn infer_raw_with_targets(
@@ -2718,20 +3154,22 @@ impl ModelEngine {
         inputs: HashMap<String, DynValue>,
         target_outputs: Option<&[&str]>,
     ) -> Result<HashMap<String, DynValue>, AppError> {
-        self.as_oneshot()?
-            .infer_raw_with_targets(inputs, target_outputs)
+        self.session.infer_raw_with_targets(inputs, target_outputs)
     }
 
-    pub fn embed_texts(&self, texts: Vec<String>) -> Result<(Vec<Vec<f32>>, usize), AppError> {
-        self.as_oneshot()?.embed_texts(texts)
+    pub fn embed_texts(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<(Vec<Vec<f32>>, usize, String), AppError> {
+        self.session.embed_texts(texts)
     }
 
     pub fn rerank_documents(
         &self,
         query: &str,
         documents: &[String],
-    ) -> Result<(Vec<f32>, usize), AppError> {
-        self.as_oneshot()?.rerank_documents(query, documents)
+    ) -> Result<(Vec<f32>, usize, String), AppError> {
+        self.session.rerank_documents(query, documents)
     }
 
     pub fn transcribe_audio(
@@ -2739,7 +3177,7 @@ impl ModelEngine {
         pcm_samples: &[f32],
         language: Option<&str>,
     ) -> Result<(String, Vec<u32>, usize), AppError> {
-        self.as_oneshot()?.transcribe_audio(pcm_samples, language)
+        self.session.transcribe_audio(pcm_samples, language)
     }
 
     pub fn system_one(
@@ -2752,17 +3190,20 @@ impl ModelEngine {
         ),
         AppError,
     > {
-        self.as_oneshot()?.system_one(questions)
+        self.session.system_one(questions)
     }
 
     pub fn uses_openjev_contract(&self) -> bool {
-        matches!(self, ModelEngine::OneShot(session) if session.uses_openjev_contract())
+        self.session.uses_openjev_contract()
     }
 
     pub fn system_one_openjev(
         &self,
         state: &serde_json::Value,
-        questions: &std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneQuestion>,
+        questions: &std::collections::BTreeMap<
+            String,
+            crate::protocol::system_one::SystemOneQuestion,
+        >,
     ) -> Result<
         (
             std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneAnswer>,
@@ -2770,13 +3211,25 @@ impl ModelEngine {
         ),
         AppError,
     > {
-        self.as_oneshot()?.system_one_openjev(state, questions)
+        self.session.system_one_openjev(state, questions)
     }
 }
 
 #[cfg(test)]
 mod decision_tests {
     use super::*;
+
+    #[test]
+    fn finds_tokenizer_nested_under_source() {
+        let path = std::env::temp_dir().join(format!("jetort-tok-{}", std::process::id()));
+        let nested = path.join("source").join("tokenizer");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("tokenizer.json");
+        std::fs::write(&file, "{}").unwrap();
+        let found = find_local_tokenizer_file(&path).unwrap();
+        assert_eq!(found, file);
+        std::fs::remove_dir_all(&path).ok();
+    }
 
     #[test]
     fn detects_gliclass_calibrator() {

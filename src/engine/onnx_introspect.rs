@@ -707,7 +707,10 @@ pub fn inspect_onnx_model(
             || inp.name == "waveform"
     });
 
-    let len = config.pad_seq_len.unwrap_or(512);
+    let len = crate::engine::provider_chain::trt_compile_max_seq(
+        config.effective_n_ctx(),
+        config.pad_seq_len,
+    );
     let max_batch = config.max_batch_size.clamp(1, 8);
     let synthesized_profiles = synthesize_trt_profiles(&inputs, max_batch, len);
 
@@ -811,6 +814,7 @@ pub fn introspect_onnx_inputs(path: &Path) -> std::io::Result<Vec<OnnxInputTenso
         top_p: None,
         top_k: None,
         repetition_penalty: None,
+        engine_kind: None,
     };
     let inspection = inspect_onnx_model(path, &dummy_config)?;
     Ok(inspection.inputs)
@@ -902,7 +906,12 @@ pub fn synthesize_trt_profiles(
 
                 let (s_min, s_opt, s_max) = match inp.dims[1] {
                     OnnxDim::Fixed(s) => (s, s, s),
-                    OnnxDim::Dynamic(_) => (1, seq_len as i64, seq_len as i64),
+                    // Opt stays below max so TRT autotune does not scratch at profile max.
+                    OnnxDim::Dynamic(_) => {
+                        let s_max = seq_len as i64;
+                        let s_opt = ((seq_len / 2).clamp(64, seq_len)) as i64;
+                        (1, s_opt, s_max)
+                    }
                 };
 
                 min_parts.push(format!("{name}:{b_min}x{s_min}"));

@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-# ponytail: same reasoning as setup_genai.sh — internal $SUDO already
+# The script keeps privilege escalation local to the individual install steps.
 # handles the one privileged step (writing to $PREFIX).
 [ "$EUID" -ne 0 ] || {
     echo "Do not run this script as root/sudo; it escalates only the steps that need it." >&2

@@ -10,26 +10,18 @@ license = "MIT"
 cuda_arch = 87
 
 [features]
-default = ["cuda", "tensorrt", "sm_87"]
+# CPU-only unless a target script selects providers. GPU arch is JETORT_CUDA_ARCH
+# / TARGET_CUDA_ARCH (see scripts/build.sh), not an empty Cargo feature.
+default = []
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 coreml = ["ort/coreml"]
 directml = ["ort/directml"]
 
-# GPU Compute Architecture profiles
-sm_87 = []
-sm_86 = []
-sm_89 = []
-sm_80 = []
-sm_90 = []
-sm_75 = []
-
 [dependencies]
 # Web framework and async runtime
 axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-async-stream = "0.3"
 tower = { version = "0.5" }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
@@ -38,13 +30,8 @@ ort = { version = "2.0.0-rc.13", features = ["load-dynamic", "half"] }
 half = { version = "2.4", default-features = false }
 parking_lot = "0.12"
 
-# Dynamic Library Loading & FFI
-libloading = "0.8"
-
-# High-level tokenizer & chat template support
+# Tokenizer for single-pass text models
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-minijinja = { version = "2", features = ["loader", "json"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Serialization and Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -60,6 +47,8 @@ base64 = "0.22"
 # Error Handling
 thiserror = "1.0"
 anyhow = "1.0"
+sha2 = "0.10"
+rayon = "1.12"
 
 [dev-dependencies]
 http-body-util = "0.1"

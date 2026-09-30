@@ -189,6 +189,8 @@ pub struct ModelMeta {
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
     pub endpoints: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,7 +306,9 @@ impl<'de> Deserialize<'de> for ChatCompletionMessage {
                         }
                         Some("input_audio") => {
                             if let Some(ia) = part.get("input_audio") {
-                                if let Ok(parsed) = serde_json::from_value::<InputAudioData>(ia.clone()) {
+                                if let Ok(parsed) =
+                                    serde_json::from_value::<InputAudioData>(ia.clone())
+                                {
                                     input_audio = Some(parsed);
                                 }
                             }
@@ -450,4 +454,57 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChatCompletionChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ChatCompletionUsage>,
+}
+
+/// One SSE error record. Failure after the stream has started must be this
+/// object and nothing else: no finish_reason and no `data: [DONE]`.
+pub fn sse_error_frame(message: &str, error_type: &str, code: &str) -> String {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": code,
+        }
+    });
+    format!("data: {body}\n\n")
+}
+
+/// OpenAI presence/frequency penalties have no GenAI equivalent. A non-default
+/// value is rejected. `0` is the OpenAI default and is accepted.
+pub fn unsupported_sampling_penalty(
+    presence_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+) -> Result<(), String> {
+    let non_default = |value: Option<f32>| value.is_some_and(|item| item.abs() > f32::EPSILON);
+    if non_default(presence_penalty) || non_default(frequency_penalty) {
+        return Err("presence_penalty and frequency_penalty are not supported".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arch_sse_error_record_shape() {
+        let frame = sse_error_frame("boom", "server_error", "inference_error");
+        assert!(frame.starts_with("data: "));
+        assert!(frame.ends_with("\n\n"));
+        assert!(!frame.contains("[DONE]"));
+        assert!(!frame.contains("finish_reason"));
+        let json: serde_json::Value =
+            serde_json::from_str(frame.trim().trim_start_matches("data: ")).unwrap();
+        assert_eq!(json["error"]["message"], "boom");
+        assert_eq!(json["error"]["type"], "server_error");
+        assert_eq!(json["error"]["code"], "inference_error");
+    }
+
+    #[test]
+    fn arch_penalties_are_not_mapped() {
+        assert!(unsupported_sampling_penalty(None, None).is_ok());
+        assert!(unsupported_sampling_penalty(Some(0.0), Some(0.0)).is_ok());
+        assert!(unsupported_sampling_penalty(Some(0.5), None).is_err());
+        assert!(unsupported_sampling_penalty(None, Some(0.2)).is_err());
+    }
 }

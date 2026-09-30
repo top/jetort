@@ -1,8 +1,8 @@
 use crate::engine::registry::ModelRegistry;
 use crate::server::handlers::{
-    audio_transcriptions, chat_completions, get_openai_model, list_openai_models, live_check,
-    memory_check, model_infer, model_load, model_metadata, model_unload, openai_embeddings,
-    ready_check, rerank, system_one,
+    audio_transcriptions, get_openai_model, list_openai_models, live_check, memory_check,
+    model_infer, model_load, model_metadata, model_unload, openai_embeddings, ready_check, rerank,
+    system_one,
 };
 use axum::{
     extract::Request,
@@ -114,9 +114,6 @@ pub fn create_router(registry: ModelRegistry) -> Router {
         .route("/health/live", get(live_check))
         .route("/v2/health/ready", get(ready_check))
         .route("/health/ready", get(ready_check))
-        // OpenAI-compatible Chat Completions
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/chat/completions", post(chat_completions))
         // OpenAI-compatible Embeddings
         .route("/v1/embeddings", post(openai_embeddings))
         .route("/embeddings", post(openai_embeddings))

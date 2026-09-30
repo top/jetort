@@ -22,7 +22,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let config = AppConfig::load_from_file(&args.config)?;
+    let mut config = AppConfig::load_from_file(&args.config)?;
     init_tracing(&config);
     let startup = Instant::now();
     info!(
@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tensorrt = cfg!(feature = "tensorrt"),
         coreml = cfg!(feature = "coreml"),
         directml = cfg!(feature = "directml"),
+        cuda_arch = option_env!("JETORT_CUDA_ARCH").unwrap_or(""),
         "compiled execution providers"
     );
 
@@ -51,7 +52,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    precompile_missing_caches(&config, &args.config)?;
+    // Cold TensorRT builds happen before the registry starts. A failed build
+    // removes TensorRT from that model's provider list for this process, so
+    // request-time loading cannot accidentally start the same build again.
+    let failed_compiles = precompile_missing_caches(&config, &args.config)?;
+    for model in &mut config.models {
+        if failed_compiles.iter().any(|name| name == &model.name) {
+            model.providers = providers_without_tensorrt(&model.providers);
+            warn!(
+                model = %model.name,
+                providers = ?model.providers,
+                "TensorRT compilation failed; this process will serve on the fallback provider"
+            );
+        }
+    }
 
     // Initialize Model Registry
     let registry = ModelRegistry::new();
@@ -86,7 +100,15 @@ fn compile_model_cache(
         .find(|model| model.name == model_name)
         .ok_or_else(|| format!("Model '{model_name}' is not configured"))?;
     let cache_dir = jetort::engine::provider::trt_cache_dir(model_config);
-    if jetort::engine::provider::has_cached_trt_engine(&cache_dir) {
+    if let Some(manifest) = trt_manifest_for(model_config) {
+        if jetort::engine::provider::trt_cache_is_current(&cache_dir, &manifest) {
+            info!(
+                model = model_name,
+                cache_dir, "TensorRT cache manifest matches; skipping compile"
+            );
+            return Ok(());
+        }
+    } else if jetort::engine::provider::has_cached_trt_engine(&cache_dir) {
         info!(
             model = model_name,
             cache_dir, "TensorRT cache already available"
@@ -94,6 +116,9 @@ fn compile_model_cache(
         return Ok(());
     }
 
+    // This command runs in a short-lived child process. Dropping the session
+    // and exiting releases Jetson's TensorRT builder allocations before the
+    // parent starts the next model.
     info!(
         model = model_name,
         "isolated TensorRT cache compilation started"
@@ -116,9 +141,9 @@ fn compile_model_cache(
 fn precompile_missing_caches(
     config: &AppConfig,
     config_path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     if !cfg!(feature = "tensorrt") {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let executable = std::env::current_exe()?;
@@ -135,13 +160,20 @@ fn precompile_missing_caches(
             continue;
         };
         let inspection = jetort::engine::session::inspect_or_fallback(&model_path, model);
-        let probe =
-            jetort::engine::header_prober::probe_model_bundle(&model_path, Some(&inspection));
-        if probe.paradigm != jetort::engine::header_prober::ModelParadigm::OneShot {
+        let probe = jetort::engine::header_prober::probe_model_bundle(
+            &model_path,
+            Some(&inspection),
+            model.engine_kind,
+        );
+        if probe.kind != jetort::config::EngineKind::OneShot {
             continue;
         }
         let cache_dir = jetort::engine::provider::trt_cache_dir(model);
-        if !jetort::engine::provider::has_cached_trt_engine(&cache_dir) {
+        let current = manifest_for_path(model, &model_path, &inspection);
+        let reusable = current.as_ref().is_some_and(|manifest| {
+            jetort::engine::provider::trt_cache_is_current(&cache_dir, manifest)
+        });
+        if !reusable {
             pending.push(model.name.clone());
         }
     }
@@ -150,6 +182,7 @@ fn precompile_missing_caches(
         models_to_compile = pending.len(),
         "TensorRT cache discovery completed"
     );
+    let mut failed = Vec::new();
     for (index, model_name) in pending.iter().enumerate() {
         info!(
             model = model_name,
@@ -164,6 +197,7 @@ fn precompile_missing_caches(
             .arg(model_name)
             .status()?;
         if !status.success() {
+            failed.push(model_name.clone());
             warn!(
                 model = model_name,
                 status = %status,
@@ -171,7 +205,59 @@ fn precompile_missing_caches(
             );
         }
     }
-    Ok(())
+    Ok(failed)
+}
+
+fn providers_without_tensorrt(providers: &[String]) -> Vec<String> {
+    use jetort::engine::provider_chain::{chain_for_target, compiled_runtime_target, Backend};
+    let auto = providers.is_empty()
+        || providers
+            .iter()
+            .any(|provider| provider.eq_ignore_ascii_case("auto"));
+    if auto {
+        return chain_for_target(compiled_runtime_target())
+            .iter()
+            .copied()
+            .filter(|backend| *backend != Backend::TensorRt && backend.is_compiled_in())
+            .map(|backend| backend.canonical_name().to_string())
+            .collect();
+    }
+    let mut kept: Vec<String> = providers
+        .iter()
+        .filter(|provider| {
+            !provider.eq_ignore_ascii_case("tensorrt") && !provider.eq_ignore_ascii_case("trt")
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        kept.push(Backend::Cpu.canonical_name().to_string());
+    }
+    kept
+}
+
+fn trt_manifest_for(
+    model: &jetort::config::ModelConfig,
+) -> Option<jetort::engine::provider::TrtCacheManifest> {
+    let (model_path, _) = jetort::engine::session::resolve_model_and_tokenizer_path(model).ok()?;
+    let inspection = jetort::engine::session::inspect_or_fallback(&model_path, model);
+    manifest_for_path(model, &model_path, &inspection)
+}
+
+fn manifest_for_path(
+    model: &jetort::config::ModelConfig,
+    model_path: &std::path::Path,
+    inspection: &jetort::engine::onnx_introspect::OnnxModelInspection,
+) -> Option<jetort::engine::provider::TrtCacheManifest> {
+    let precision = match inspection.quantization_kind {
+        jetort::engine::onnx_introspect::QuantizationKind::ExplicitQdqInt8 => "INT8",
+        jetort::engine::onnx_introspect::QuantizationKind::Fp16 => "FP16",
+        _ => "FP16",
+    };
+    jetort::engine::provider::current_trt_manifest(
+        model_path,
+        precision,
+        &jetort::engine::provider::trt_profile_signature(model),
+    )
 }
 
 fn init_tracing(config: &AppConfig) {
@@ -226,6 +312,7 @@ fn init_onnxruntime(config: &AppConfig) -> Result<(), Box<dyn std::error::Error>
                     || message.contains("could not be allocated")
                     || message.contains("IBuilder::buildSerializedNetwork")
                     || message.contains("Could not find any implementation for node")
+                    || message.contains("Could not find a CPU kernel")
                     || message.contains("insufficient workspace")
                     || message.contains("computeCosts")
                     || message.contains("ForeignNode");
@@ -246,13 +333,6 @@ fn init_onnxruntime(config: &AppConfig) -> Result<(), Box<dyn std::error::Error>
             },
         ))
     };
-
-    // 0. Explicit GenAI library path in config.yaml
-    if let Some(ref path) = config.server.genai_dylib_path {
-        info!("Setting GenAI dylib path from config: {}", path);
-        env::set_var("ORT_GENAI_DYLIB_PATH", path);
-        env::set_var("OGA_DYLIB_PATH", path);
-    }
 
     // 1. Explicit path in config.yaml
     if let Some(ref path) = config.server.ort_dylib_path {

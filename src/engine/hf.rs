@@ -9,10 +9,7 @@ pub struct ResolvedModelPaths {
 }
 
 /// Resolves model and optional tokenizer from local Hugging Face CLI cache (~/.cache/huggingface/hub/...)
-pub fn resolve_from_hf_cache(
-    hf_repo: &str,
-    hf_file: Option<&str>,
-) -> Option<ResolvedModelPaths> {
+pub fn resolve_from_hf_cache(hf_repo: &str, hf_file: Option<&str>) -> Option<ResolvedModelPaths> {
     let hub_dir = get_hf_hub_cache_dir()?;
     let repo_dir_name = format!("models--{}", hf_repo.replace('/', "--"));
     let repo_dir = hub_dir.join(repo_dir_name);
@@ -88,7 +85,10 @@ fn get_hf_hub_cache_dir() -> Option<PathBuf> {
     }
 
     if let Ok(home) = env::var("HOME") {
-        let p = PathBuf::from(home).join(".cache").join("huggingface").join("hub");
+        let p = PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub");
         if p.exists() {
             return Some(p);
         }
@@ -230,4 +230,3 @@ fn find_fuzzy_vocab_recursive(dir: &Path) -> Option<PathBuf> {
     }
     None
 }
-

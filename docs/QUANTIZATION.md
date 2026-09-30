@@ -35,10 +35,13 @@ python tools/cooker.py \
   --type embedding
 ```
 
-### What `cooker.py` Automates:
-1. **Config Synthesis**: If `genai_config.json` is missing, it inspects `config.json` and synthesizes Microsoft ORT-GenAI compatible topology configurations.
-2. **Static Calibration**: Injects explicit QDQ nodes (`QuantFormat.QDQ`) with per-channel weight scaling.
-3. **Metadata Stamping**: Embeds `jetort.framework_type` and `jetort.quant_type = "int8_qdq"` directly into the ONNX Protobuf header.
+### What `cooker.py` does today
+The script is not the engine's packaging toolchain. A `genai_config.json` it writes is not by itself how JetOrt classifies a model. JetOrt refuses autoregressive models detected from paired KV tensors or a trustworthy decoder marker. A thin `genai_config.json` does not trigger that refusal.
+
+What the current script actually attempts:
+1. **Config synthesis**: If `genai_config.json` is missing and the `--type` / filename heuristic says the model is generative, it writes a config from `config.json`. That file is not a completed cooker contract.
+2. **QDQ attempt**: Calls `onnxruntime.quantization.quantize_static` when that package imports. On failure it copies the ONNX file unchanged.
+3. **Metadata stamping**: When the `onnx` package is installed, it writes `jetort.framework_type` and `jetort.quant_type` onto `model.onnx`.
 
 ---
 
@@ -57,7 +60,7 @@ python tools/validate.py ./bundles/qwen2.5-0.5b-int8-qdq
 ==================================================================
 📄 Bundle Structure Audit:
    • model.onnx:              ✅ Present
-   • genai_config.json:       ✅ Present (GenAI Mode)
+   • genai_config.json:       file present is not an engine kind
    • tokenizer.json:          ✅ Present
    • tokenizer_config.json:   ✅ Present
    • vision_encoder.onnx:     ⚪ Absent (One-Shot Mode)

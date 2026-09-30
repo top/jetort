@@ -1,0 +1,16 @@
+server:
+  port: 11433
+  log_level: info
+
+models:
+  - name: Qwen3-Embedding-0.6B
+    path: /home/ray/quant_pipeline/work/Qwen_Qwen3-Embedding-0.6B
+    file: model_fp16.onnx
+
+  - name: Qwen3-Reranker-0.6B
+    path: /home/ray/quant_pipeline/work/Qwen_Qwen3-Reranker-0.6B/
+    file: model_fp16.onnx
+
+  - name: Laya
+    path: /home/ray/quant_pipeline/work/convaiinnovations_laya/
+    file: model_fp16.onnx

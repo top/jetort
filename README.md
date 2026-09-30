@@ -1,7 +1,7 @@
 # JetOrt
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/raytang/jetort/main/assets/banner.png" alt="JetOrt Banner" width="700" onerror="this.style.display='none'"/>
+  <img src="https://raw.githubusercontent.com/top/jetort/main/assets/banner.png" alt="JetOrt Banner" width="700" onerror="this.style.display='none'"/>
 </p>
 
 <p align="center">
@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/raytang/jetort/actions"><img src="https://img.shields.io/github/actions/workflow/status/raytang/jetort/ci.yml?branch=main&label=CI&logo=github" alt="CI Status"/></a>
+  <a href="https://github.com/top/jetort/actions"><img src="https://img.shields.io/github/actions/workflow/status/top/jetort/ci.yml?branch=main&label=CI&logo=github" alt="CI Status"/></a>
   <a href="https://crates.io/crates/jetort"><img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg?logo=rust" alt="Rust Version"/></a>
-  <a href="https://github.com/raytang/jetort/releases"><img src="https://img.shields.io/github/v/release/raytang/jetort?color=blue&logo=github" alt="GitHub Release"/></a>
-  <a href="https://github.com/raytang/jetort/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"/></a>
+  <a href="https://github.com/top/jetort/releases"><img src="https://img.shields.io/github/v/release/top/jetort?color=blue&logo=github" alt="GitHub Release"/></a>
+  <a href="https://github.com/top/jetort/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"/></a>
   <a href="https://platform.openai.com/docs/api-reference"><img src="https://img.shields.io/badge/OpenAI%20API-Compatible-412991.svg" alt="OpenAI Compatible"/></a>
   <a href="https://kserve.github.io/website/latest/modelserving/data_plane/v2_protocol/"><img src="https://img.shields.io/badge/KServe%20v2-CNCF%20Standard-blue.svg" alt="KServe v2"/></a>
 </p>
@@ -23,7 +23,7 @@
 
 Modern AI deployments typically pair a generative Large Language Model (LLM) with auxiliary perception models for embeddings, cross-encoder reranking, speech recognition (ASR), and computer vision.
 
-While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary models are traditionally run through Python stacks (PyTorch, Transformers, FastAPI). This introduces severe overhead:
+JetOrt runs single-pass ONNX models: embeddings, rerank, CTC ASR, classifiers, vision encoders, and raw tensors. Autoregressive graphs (paired KV cache, or a genai config that describes a decoder loop) are detected and refused at load. A `genai_config.json` file by itself does not make a model autoregressive. Chat stays on a decoder runtime outside this process. Auxiliary models are otherwise stuck in Python stacks (PyTorch, Transformers, FastAPI), which introduces severe overhead:
 * **Hundreds of megabytes to gigabytes of VRAM/RAM overhead** just for Python runtime and PyTorch dependencies.
 * **Global Interpreter Lock (GIL) contention** bottlenecking concurrent I/O.
 * **Complex runtime environments** (CUDA wheels, Python virtualenvs, C ABI incompatibilities).
@@ -42,17 +42,16 @@ While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary m
 |                                                                                   |
 |  +---------------------------------------+  +----------------------------------+  |
 |  |  OpenAI Protocol Layer (/v1)          |  | CNCF KServe v2 Protocol Layer    |  |
-|  |  * /v1/chat/completions (SSE Stream)  |  |  * /v2/health/live               |  |
-|  |  * /v1/models                         |  |  * /v2/health/ready              |  |
-|  |  * /v1/embeddings                     |  |  * /v2/models/:name              |  |
-|  |  * /v1/rerank                         |  |  * /v2/models/:name/infer        |  |
-|  |  * /v1/systemone                      |  |  * /v2/repository/models/...     |  |
+|  |  * /v1/models                         |  |  * /v2/health/live               |  |
+|  |  * /v1/embeddings                     |  |  * /v2/health/ready              |  |
+|  |  * /v1/rerank                         |  |  * /v2/models/:name              |  |
+|  |  * /v1/systemone                      |  |  * /v2/models/:name/infer        |  |
 |  |  * /v1/audio/transcriptions           |  |  * /v2/repository/models/...     |  |
 |  +---------------------------------------+  +----------------------------------+  |
 |                                         |                                         |
 |                 +-----------------------v-----------------------+                 |
 |                 | Tokenizer & Vocab Auto-Discovery              |                 |
-|                 | (tokenizer.json, vocab.json, Jinja2 template) |                 |
+|                 | (tokenizer.json, vocab.json, vocab.txt)       |                 |
 |                 +-----------------------+-----------------------+                 |
 |                                         |                                         |
 |                 +-----------------------v-----------------------+                 |
@@ -63,7 +62,8 @@ While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary m
                                           v
 +-----------------------------------------------------------------------------------+
 |                             Hardware Execution Tier                               |
-|        TensorRT (Cached Engine) -> CUDA -> CoreML -> DirectML -> CPU              |
+|  Single-pass ONNX Runtime. Autoregressive graphs are refused at load.           |
+|  Provider chain depends on the build target (see scripts/build.sh)               |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -72,7 +72,6 @@ While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary m
 ## Key Features
 
 * **High-Fidelity OpenAI API Parity**:
-  - `/v1/chat/completions`: Full streaming SSE (`stream: true` with standard `data: {...}` and `data: [DONE]`, `stream_options.include_usage`) and non-streaming responses. Accurate `finish_reason` (`stop` vs `length`), system fingerprints, and token metrics.
   - `/v1/models`: OpenAI-compatible enumeration plus llama.cpp-style runtime `meta`; calibrated decision models are also listed in TypeSafe's `models` shape.
   - `/v1/embeddings`: Full usage token metrics (`prompt_tokens`, `total_tokens`), Matryoshka dimensionality reduction (`dimensions`), and L2 normalization.
   - `/v1/audio/transcriptions`: Supports standard `multipart/form-data` and `application/json`, output formats (`json`, `verbose_json`, `text`), and token usage reporting.
@@ -87,16 +86,17 @@ While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary m
 * **TypeSafe System One API Compatibility**:
   - `/v1/systemone`: Choice, Score, and Noul questions backed by calibrated GLiClass/OpenJev ONNX bundles.
   - Automatically detects `config.json`, `tokenizer.json`, and `calibrator.json`; no JetOrt-specific model type setting is required.
-* **CNCF KServe v2 Data Plane (Open Inference Protocol)**:
-  - Standard multi-dimensional raw tensor forward passes (`/v2/models/{name}/infer`), model metadata reflection, and health probes (`/v2/health/live`, `/v2/health/ready`).
+* **KServe v2 health and metadata**:
+  - `/v2/health/live`, `/v2/health/ready`, and `/v2/models/{name}` metadata. `/v2/models/{name}/infer` is a placeholder that returns HTTP 501 `not_implemented` and is not listed on model cards.
 * **Universal Model-Agnostic Tokenizer & Vocab Auto-Discovery**:
   - Automatically locates and parses `tokenizer.json`, `vocab.json`, `vocab.txt`, `tokens.txt`, and `dict.txt` from local Hugging Face cache snapshots.
-* **Multiplatform Acceleration with Auto-Fallback**:
-  - Full execution provider cascade: `TensorRT -> CUDA -> CoreML -> DirectML -> CPU`.
+* **Per-target execution providers**:
+  - `scripts/build.sh --target` selects the chain compiled into the binary: Jetson and Linux NVIDIA `TensorRT → CUDA → CPU`, macOS `CoreML → CPU`, Windows NVIDIA `TensorRT → CUDA → CPU`, Windows (including AMD) `DirectML → CPU`, Linux AMD and CPU `CPU`. The provider name in logs and `/v1/models` is the backend that actually loaded.
 * **Persistent TensorRT Engine Cache**:
-  - Automatically compiles and serializes TensorRT engines to `.cache/<model>` to eliminate subsequent warmup delays across restarts.
-* **Dynamic Static-Shape Auto-Padding**:
-  - Configurable `pad_seq_len` automatically pads smaller inputs with zeros and truncates larger inputs in-memory, allowing models with static dimensions to accept variable-length inputs without caller-side manipulation.
+  - At startup, missing TensorRT engines are compiled one model at a time in isolated processes and serialized to `.cache/<model>`. Successful builds are reused across restarts.
+  - If a build fails, that model immediately uses the next configured provider for the current process; requests never trigger another TensorRT build.
+* **Sequence padding**:
+  - `pad_seq_len` defaults to dynamic (unset) on CUDA and CPU. It is not the context length. When the loaded backend is TensorRT, sequences use the smallest of 128/256/512/1024 that fits the input and `n_ctx`.
 * **Smart Model Alias & Fallback Routing**:
   - Built-in fallback routing handles clients that hardcode `whisper-1` or `text-embedding-ada-002` by automatically delegating to registered audio or embedding models.
 * **Zero-Downtime Hot Reload**:
@@ -109,15 +109,18 @@ While tools like `llama.cpp` excel at autoregressive LLM generation, auxiliary m
 ### 1. Installation
 
 #### Option A: Pre-built Binaries
-Download the latest release binary for your platform from [GitHub Releases](https://github.com/raytang/jetort/releases).
+Download the latest release binary for your platform from [GitHub Releases](https://github.com/top/jetort/releases).
 
-#### Option B: Build from Source
-Ensure Rust 1.80+ is installed:
+#### Option B: Build from this checkout
 ```bash
-git clone https://github.com/raytang/jetort.git
-cd jetort
-cargo build --release
+./scripts/build.sh --target cpu
+./target/release/jetort --config config.yaml
 ```
+On a Jetson:
+```bash
+./scripts/jetson.sh
+```
+`jetson.sh` only fills Jetson parameters and calls `build.sh`, then installs the user service and starts it. Other targets: `./scripts/build.sh --target linux-nvidia|macos|windows-nvidia|windows-other|linux-amd|cpu`. With no `--target` on a terminal, the script asks; without a terminal it exits. Default Cargo features are CPU-only.
 The compiled binary will be located at `target/release/jetort`.
 
 ---
@@ -190,62 +193,11 @@ INFO jetort: Starting HTTP inference service listening on http://0.0.0.0:11433
 
 ## API Reference & Usage Examples
 
-### 1. Chat Completions (`/v1/chat/completions` & `/chat/completions`)
+### Chat
 
-Fully compatible with official OpenAI SDKs, LangChain, OpenWebUI, LlamaIndex, and cURL. Supports both token streaming via Server-Sent Events (SSE) and synchronous responses.
+`/v1/chat/completions` is not served. JetOrt loads single-pass ONNX models only. A graph with a decoder loop is refused at load and is not executed.
 
-#### cURL Streaming SSE Example (`stream: true`):
-```bash
-curl -N -s http://localhost:11433/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "MiniCPM5-2B",
-    "messages": [
-      {"role": "user", "content": "Hello! Introduce yourself briefly."}
-    ],
-    "max_tokens": 64,
-    "temperature": 0.7,
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
-
-Stream Output:
-```text
-data: {"id":"chatcmpl-1790261413473","object":"chat.completion.chunk","created":1790261413,"model":"MiniCPM5-2B","system_fingerprint":"fp_jetort","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
-
-data: {"id":"chatcmpl-1790261413473","object":"chat.completion.chunk","created":1790261413,"model":"MiniCPM5-2B","system_fingerprint":"fp_jetort","choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}
-
-data: {"id":"chatcmpl-1790261413473","object":"chat.completion.chunk","created":1790261413,"model":"MiniCPM5-2B","system_fingerprint":"fp_jetort","choices":[{"index":0,"delta":{"content":"!"},"logprobs":null,"finish_reason":null}]}
-
-data: {"id":"chatcmpl-1790261413473","object":"chat.completion.chunk","created":1790261413,"model":"MiniCPM5-2B","system_fingerprint":"fp_jetort","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
-
-data: {"id":"chatcmpl-1790261413473","object":"chat.completion.chunk","created":1790261413,"model":"MiniCPM5-2B","system_fingerprint":"fp_jetort","choices":[],"usage":{"prompt_tokens":14,"completion_tokens":20,"total_tokens":34}}
-
-data: [DONE]
-```
-
-#### Python OpenAI SDK Example:
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:11433/v1", api_key="not-needed")
-
-response = client.chat.completions.create(
-    model="MiniCPM5-2B",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": "Tell me a fun fact."}
-    ],
-    stream=True
-)
-
-for chunk in response:
-    content = chunk.choices[0].delta.content if chunk.choices else ""
-    if content:
-        print(content, end="", flush=True)
-print()
-```
+---
 
 ---
 
@@ -522,26 +474,10 @@ curl -s http://localhost:11433/v2/models/qwen3-embedding | jq
 ```
 
 #### Raw Tensor Forward Execution:
-```bash
-curl -s -X POST http://localhost:11433/v2/models/qwen3-embedding/infer \
-  -H "Content-Type: application/json" \
-  -d '{
-    "inputs": [
-      {
-        "name": "input_ids",
-        "shape": [1, 4],
-        "datatype": "INT64",
-        "data": [101, 2054, 2003, 102]
-      },
-      {
-        "name": "attention_mask",
-        "shape": [1, 4],
-        "datatype": "INT64",
-        "data": [1, 1, 1, 1]
-      }
-    ]
-  }' | jq
-```
+
+`POST /v2/models/{name}/infer` is reserved for the KServe v2 data-plane
+implementation and currently returns HTTP 501 `not_implemented`. Use the
+OpenAI-compatible endpoints above for supported inference operations.
 
 #### Zero-Downtime Model Reload & Unload:
 ```bash
@@ -570,7 +506,6 @@ server:
   log_level: info
   inference_threads: 4            # Worker thread pool size for blocking forward passes
   ort_dylib_path: null            # Optional manual path to libonnxruntime.so
-  genai_dylib_path: null          # Optional manual path to libonnxruntime-genai.so (OGA_DYLIB_PATH)
 
 models:
   - name: "verdict"
@@ -579,7 +514,7 @@ models:
     hf_file: "model_fp16.onnx"
     pad_seq_len: null             # Dynamic sequence length (or integer for fixed padding)
     providers: ["auto"]           # "auto", "TensorRT", "CUDA", "CoreML", "CPU"
-    load_on_startup: true         # Load after all missing TensorRT caches are compiled
+    load_on_startup: true         # Load after startup TensorRT cache attempts complete
     # trt_cache_dir: "./custom-cache" # Optional; defaults to .cache/<name>
     intra_threads: 2
     inter_threads: 1
@@ -599,49 +534,12 @@ models:
     hf_repo: "onnx-community/bge-reranker-v2-m3-ONNX"
     hf_file: "onnx/model_int8.onnx"
 
-  - name: "MiniCPM5-2B"
-    path: "/home/ray/quant_pipeline/work/openbmb_MiniCPM5-2B/genai_int8_mixed_cuda"
-    file: "model.onnx"
-    ctx_size: 32768
-    # llama.cpp `models.ini`-style per-model sampling defaults. Applied only when a
-    # /v1/chat/completions request doesn't set its own value; a per-request value always
-    # wins. Useful because some fine-tunes (reasoning/tool-calling models in particular)
-    # only produce well-formed output at a specific temperature/top_p/top_k.
-    temperature: 1.0               # alias: temp
-    top_p: 0.95                    # alias: top-p
-    top_k: 40                      # alias: top-k
-    repetition_penalty: 1.1        # aliases: repeat_penalty, repeat-penalty, repetition-penalty
 ```
 
-JetOrt does not require a model `type`. It detects GenAI, Hybrid, ASR, Embedding, Reranker,
-and supported System One bundles from companion files and ONNX input/output metadata. Use the
+JetOrt does not require a model `type`. It detects a decoder loop from the graph and refuses that model. A `genai_config.json` file by itself does not. `engine_kind` is only for the ambiguous case.
+System One bundles are detected from companion files and ONNX input/output metadata. Use the
 llama.cpp-style `alias`, `ctx_size`, and `batch_size` names only when an override is needed.
 JetOrt's lifecycle control is `load_on_startup`.
-
-### Per-Model Default Sampling Parameters
-
-Mirroring llama.cpp's `models.ini` (`temp`, `top-p`, `load-on-startup`, ...), each entry under
-`models:` may set its own default `temperature`, `top_p`, `top_k`, and `repetition_penalty`.
-This matters because some models (especially reasoning/tool-calling fine-tunes) only emit
-well-formed output — closed tags, complete tool calls, correctly terminated Markdown — at a
-specific sampling configuration; leaving generation at the server's hardcoded defaults can
-silently produce malformed completions that look like an inference bug but are actually a
-mismatched sampling config.
-
-Resolution order for every `/v1/chat/completions` request, per parameter:
-
-1. The value set explicitly in the request body (OpenAI-compatible `temperature`/`top_p`, plus
-   the non-standard `top_k` extension field also honored by llama.cpp/vLLM-style servers).
-2. This model's `config.yaml` default (`temperature`/`top_p`/`top_k`/`repetition_penalty`, or
-   their llama.cpp-style aliases `temp`/`top-p`/`top-k`/`repeat-penalty`).
-3. JetOrt's server-wide fallback (`temperature: 0.7`, `top_p: 0.95`, no `top_k`/`repetition_penalty`).
-
-`repetition_penalty` additionally accepts the request's OpenAI `presence_penalty` or
-`frequency_penalty` fields ahead of the model default, for compatibility with existing
-OpenAI-style clients that don't know about `repetition_penalty` directly.
-
-`top_k` currently only applies to Autoregressive GenAI (ORT-GenAI) models; it is a no-op for
-other paradigms.
 
 ### Operational Logging
 
@@ -655,8 +553,7 @@ existing correlation ID.
 RUST_LOG=jetort=debug,ort=warn cargo run --release -- --config config.yaml
 ```
 
-Logs always use the compact operational format. Generation logs include prompt evaluation and decoding tokens/second; embedding, reranking,
-raw ONNX, System One, and transcription logs include their relevant batch or realtime metrics.
+Logs always use the compact operational format. Embedding, reranking, raw ONNX, System One, and transcription logs include batch size, token counts, and tokens per second for the forward pass.
 
 ### Model Lifecycle and Memory Pressure
 
@@ -664,7 +561,8 @@ Startup is deliberately sequential:
 
 1. Discover every configured model and inspect its TensorRT cache.
 2. Compile each missing OneShot TensorRT cache in a separate child process, one at a time.
-3. After compilation is complete, load `load_on_startup: true` models in configuration order.
+3. If a compile fails, remove TensorRT from that model's provider list for this process and continue with CUDA/CPU.
+4. After compilation is complete, load `load_on_startup: true` models in configuration order.
 
 The compiler process exits after each model so CUDA, TensorRT, and Jetson UMA build allocations
 are fully reclaimed before the next model. JetOrt automatically reserves 12.5% of system memory
@@ -672,24 +570,11 @@ are fully reclaimed before the next model. JetOrt automatically reserves 12.5% o
 leases protect in-flight inference, including streaming responses, until completion.
 
 Configured models remain visible in `/v1/models` with `meta.state` such as `loaded`, `unloaded`,
-`loading`, or `failed`. Requesting an unloaded model starts one serialized background load and
-returns:
+`loading`, or `failed`. `load_on_startup: false` skips startup load; the first request loads
+that model using the already selected provider chain. Requests do not initiate a cold TensorRT
+build. If loading fails, `meta.state` is `failed` and the model is not served as loaded.
 
-```http
-HTTP/1.1 503 Service Unavailable
-Retry-After: 2
-```
-
-```json
-{
-  "error": "Model 'example' is not loaded",
-  "code": "model_not_loaded",
-  "state": "loading",
-  "retryable": true
-}
-```
-
-Retry after the model reaches `loaded`. `POST /v2/repository/models/:name/load` returns
+`POST /v2/repository/models/:name/load` returns
 `202 Accepted`; unloading an active model is deferred until its current requests finish.
 
 ---
@@ -699,8 +584,9 @@ Retry after the model reaches `loaded`. `POST /v2/repository/models/:name/load` 
 ### NVIDIA Jetson (JetPack 5.x / 6.x / L4T)
 
 TensorRT cold compilation temporarily consumes several copies of FP16 weights plus tactic
-workspace in unified memory. JetOrt now skips cold compilation and falls back to CUDA when the
-estimated peak would exhaust safe NvMap headroom. A cached TensorRT engine is still loaded.
+workspace in unified memory. JetOrt attempts it during startup, one model at a time. If the
+build fails, the process continues on CUDA/CPU; a cached TensorRT engine is still loaded when
+available.
 
 For a 0.6B FP16 embedding or reranker on a 16 GB Jetson, build the cache with that model loaded
 alone, then restore the full configuration:
@@ -730,18 +616,13 @@ with `ldconfig`/`ldd` and skipped without downloading or overwriting anything.
    ./scripts/setup_onnxruntime.sh --check
    ```
 
-2. **Install or build ONNX Runtime GenAI when generative models are needed**:
+2. **Build and start on Jetson**:
    ```bash
-   ./scripts/setup_genai.sh
-   ./scripts/setup_genai.sh --check
+   ./scripts/jetson.sh
    ```
-
-3. **Build JetOrt and install/update its user service**:
-   ```bash
-   ./scripts/deploy.sh
-   ```
-   `deploy.sh` never installs Rust or system libraries. Use `--no-service` for a build only, or
-   `--no-start` to update the unit without restarting it.
+   `jetson.sh` calls `build.sh --target jetson` (CUDA arch 87 from `Cargo.toml`) and then
+   `install-user-service.sh`. `--no-service` builds only. `--no-start` installs the unit
+   without restarting it. `deploy.sh` does not compile.
 
    On NVIDIA systems, deployment enables TensorRT only when all three required components are
    found: `libnvinfer.so`, `NvInfer.h`, and the ONNX Runtime TensorRT provider library. Detection
@@ -749,13 +630,12 @@ with `ldconfig`/`ldd` and skipped without downloading or overwriting anything.
    before compilation. At startup JetOrt logs its compiled providers and each model's automatic
    priority order (`TensorRT -> CUDA -> CPU`).
 
-All setup scripts accept `--force` and `--prefix`. Use `--wheel` for an explicit ORT wheel and
-`--package` for a prebuilt GenAI archive. For a complete fresh installation:
+All setup scripts accept `--force` and `--prefix`. Use `--wheel` for an explicit ORT wheel.
+For a complete fresh installation:
 
 ```bash
 ./scripts/setup_onnxruntime.sh &&
-./scripts/setup_genai.sh &&
-./scripts/deploy.sh
+./scripts/jetson.sh
 ```
 
 4. **Systemd Service Management**:
@@ -775,7 +655,7 @@ JetOrt compiles natively across all major platforms:
 ## Contributing
 
 Contributions, issues, and feature requests are welcome!
-Feel free to check [issues page](https://github.com/raytang/jetort/issues) for open tasks.
+Feel free to check [issues page](https://github.com/top/jetort/issues) for open tasks.
 
 To run the test suite:
 ```bash

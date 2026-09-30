@@ -439,7 +439,10 @@ pub fn openjev_render_options(question: &SystemOneQuestion) -> Vec<String> {
             .enumerate()
             .map(|(index, description)| format!("level {index}: {}", entry_text(description)))
             .collect(),
-        SystemOneQuestion::Noul { instructions, criteria } => {
+        SystemOneQuestion::Noul {
+            instructions,
+            criteria,
+        } => {
             let proposition = entry_text(instructions);
             let (true_description, false_description) = criteria
                 .as_ref()
@@ -475,9 +478,7 @@ pub fn openjev_render_options(question: &SystemOneQuestion) -> Vec<String> {
 /// answer's `probabilities` map and to resolve the winning `Choice`.
 pub fn openjev_option_ids(question: &SystemOneQuestion) -> Vec<String> {
     match question {
-        SystemOneQuestion::Choice { criteria, .. } => {
-            criteria.keys().cloned().collect()
-        }
+        SystemOneQuestion::Choice { criteria, .. } => criteria.keys().cloned().collect(),
         SystemOneQuestion::Score { criteria, .. } => {
             (0..criteria.len()).map(|index| index.to_string()).collect()
         }

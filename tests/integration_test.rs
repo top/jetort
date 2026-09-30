@@ -123,7 +123,10 @@ async fn test_model_not_found_infer() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "not_implemented");
 }
 
 #[tokio::test]
@@ -178,13 +181,16 @@ models:
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get("retry-after").unwrap(), "2");
+    assert_ne!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["code"], "model_not_loaded");
-    assert_eq!(json["state"], "loading");
-    assert_eq!(json["retryable"], true);
+    assert_ne!(json["state"], "loading");
+    let message = json["error"].as_str().unwrap_or("");
+    let details = json["details"].as_str().unwrap_or("");
+    assert!(
+        message.contains("does not exist") || details.contains("does not exist"),
+        "load failure should surface the missing file, got {json}"
+    );
 }
 
 #[tokio::test]
@@ -488,7 +494,7 @@ async fn test_health_memory_endpoint() {
 }
 
 #[tokio::test]
-async fn test_chat_completions_model_not_found() {
+async fn test_chat_completions_removed() {
     let registry = ModelRegistry::new();
     let app = create_router(registry);
 
@@ -512,63 +518,6 @@ async fn test_chat_completions_model_not_found() {
         .unwrap();
 
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    let body = res.into_body().collect().await.unwrap().to_bytes();
-    let json: Value = serde_json::from_slice(&body).unwrap();
-    assert!(json["error"].as_str().unwrap().contains("not found"));
-}
-
-#[test]
-fn test_chat_template_rendering() {
-    use jetort::engine::genai::{ChatMessage, GenAiSession};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    let session = GenAiSession {
-        name: "test-qwen".to_string(),
-        aliases: vec![],
-        active_provider: "test".to_string(),
-        inputs_metadata: vec![],
-        outputs_metadata: vec![],
-        model_dir: PathBuf::from("."),
-        chat_template: Some(
-            "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}".to_string()
-        ),
-        hf_tokenizer: None,
-        model: None,
-        tokenizer: None,
-        inference_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-        init_error: None,
-        n_ctx_train: 131072,
-        n_ctx: 4096,
-        n_batch: 512,
-        model_path: PathBuf::from("model.onnx"),
-        default_temperature: None,
-        default_top_p: None,
-        default_top_k: None,
-        default_repetition_penalty: None,
-    };
-
-    let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: "You are a helpful assistant.".to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: "Hello, how are you?".to_string(),
-            reasoning_content: None,
-            tool_calls: None,
-        },
-    ];
-
-    let rendered = session
-        .render_chat_template(&messages, true, &[], Some(true))
-        .expect("Rendering should succeed");
-    assert!(rendered.contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>"));
-    assert!(rendered.contains("<|im_start|>user\nHello, how are you?<|im_end|>"));
-    assert!(rendered.ends_with("<|im_start|>assistant\n"));
 }
 
 #[test]

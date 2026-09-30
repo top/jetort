@@ -21,7 +21,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release --features cuda,tensorrt
+RUN cargo build --release --no-default-features --features cuda,tensorrt
 
 # Runtime Stage
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04

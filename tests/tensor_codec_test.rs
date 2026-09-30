@@ -715,7 +715,8 @@ fn test_comprehensive_onnx_model_inspection() {
 
 #[test]
 fn test_header_prober_bundle_and_paradigm_detection() {
-    use jetort::engine::header_prober::{probe_model_bundle, ModelParadigm};
+    use jetort::config::EngineKind;
+    use jetort::engine::header_prober::probe_model_bundle;
     use std::fs::File;
     use std::io::Write;
 
@@ -726,19 +727,19 @@ fn test_header_prober_bundle_and_paradigm_detection() {
     let mut f = File::create(&model_path).unwrap();
     f.write_all(b"dummy onnx content").unwrap();
 
-    // 1. Without genai_config.json -> OneShot
-    let probe = probe_model_bundle(&model_path, None);
-    assert_eq!(probe.paradigm, ModelParadigm::OneShot);
+    let probe = probe_model_bundle(&model_path, None, None);
+    assert_eq!(probe.kind, EngineKind::OneShot);
     assert!(!probe.has_genai_config);
 
-    // 2. With genai_config.json -> AutoregressiveGenAi
+    // A genai_config.json that does not describe a decoder loop stays one-shot.
     let genai_cfg_path = dir.join("genai_config.json");
     let mut cfg_f = File::create(&genai_cfg_path).unwrap();
     cfg_f.write_all(b"{\"model\": {}}").unwrap();
 
-    let probe2 = probe_model_bundle(&model_path, None);
-    assert_eq!(probe2.paradigm, ModelParadigm::AutoregressiveGenAi);
+    let probe2 = probe_model_bundle(&model_path, None, None);
+    assert_eq!(probe2.kind, EngineKind::OneShot);
     assert!(probe2.has_genai_config);
+    assert!(!probe2.genai_config_substantive);
 
     // Clean up
     let _ = std::fs::remove_dir_all(&dir);
