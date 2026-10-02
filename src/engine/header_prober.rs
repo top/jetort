@@ -26,13 +26,7 @@ enum GenaiConfigSignal {
     DecoderLoop,
 }
 
-/// Task used for built-in aliases. Shape rank alone is not a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelTask {
-    Audio,
-    Embedding,
-    Unknown,
-}
+pub use crate::engine::task::ModelTask;
 
 impl std::fmt::Display for EngineKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -458,11 +458,50 @@ fn test_semantic_trt_dynamic_profile_synthesizer() {
     assert_eq!(nlp_profiles.min_shapes, "input_ids:1x1,attention_mask:1x1");
     assert_eq!(
         nlp_profiles.opt_shapes,
-        "input_ids:1x512,attention_mask:1x512"
+        "input_ids:1x256,attention_mask:1x256"
     );
     assert_eq!(
         nlp_profiles.max_shapes,
         "input_ids:8x512,attention_mask:8x512"
+    );
+
+    // 2b. Decision Model (e.g. Julia-1 with options / markers)
+    let decision_inputs = vec![
+        OnnxInputTensorInfo {
+            name: "input_ids".to_string(),
+            elem_type: 7,
+            dims: vec![
+                OnnxDim::Dynamic("batch".to_string()),
+                OnnxDim::Dynamic("tokens".to_string()),
+            ],
+        },
+        OnnxInputTensorInfo {
+            name: "marker_pos".to_string(),
+            elem_type: 7,
+            dims: vec![
+                OnnxDim::Dynamic("batch".to_string()),
+                OnnxDim::Dynamic("options".to_string()),
+            ],
+        },
+        OnnxInputTensorInfo {
+            name: "qtype".to_string(),
+            elem_type: 7,
+            dims: vec![OnnxDim::Dynamic("batch".to_string())],
+        },
+    ];
+    let decision_profiles =
+        synthesize_trt_profiles(&decision_inputs, 4, 1024).expect("Decision synthesis should succeed");
+    assert_eq!(
+        decision_profiles.min_shapes,
+        "input_ids:1x1,marker_pos:1x1,qtype:1"
+    );
+    assert_eq!(
+        decision_profiles.opt_shapes,
+        "input_ids:1x512,marker_pos:1x4,qtype:1"
+    );
+    assert_eq!(
+        decision_profiles.max_shapes,
+        "input_ids:4x1024,marker_pos:4x32,qtype:4"
     );
 
     // 3. Vision Model (e.g. ResNet / ViT)

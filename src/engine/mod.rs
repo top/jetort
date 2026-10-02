@@ -8,6 +8,7 @@ pub mod provider_chain;
 pub mod registry;
 pub mod session;
 pub mod session_pool;
+pub mod task;
 pub mod timings;
 
 pub use audio::*;
@@ -20,4 +21,6 @@ pub use provider_chain::*;
 pub use registry::*;
 pub use session::*;
 pub use session_pool::*;
+pub use task::*;
 pub use timings::*;
+

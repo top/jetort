@@ -17,6 +17,8 @@ pub struct OnnxInputTensorInfo {
     pub dims: Vec<OnnxDim>,
 }
 
+pub type OnnxOutputTensorInfo = OnnxInputTensorInfo;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrtDynamicProfiles {
     pub min_shapes: String,
@@ -711,7 +713,7 @@ pub fn inspect_onnx_model(
         config.effective_n_ctx(),
         config.pad_seq_len,
     );
-    let max_batch = config.max_batch_size.clamp(1, 8);
+    let max_batch = config.max_batch_size.clamp(1, 32);
     let synthesized_profiles = synthesize_trt_profiles(&inputs, max_batch, len);
 
     let (trt_compilation_feasible, trt_skip_reason) = {
@@ -787,6 +789,7 @@ pub fn introspect_onnx_inputs(path: &Path) -> std::io::Result<Vec<OnnxInputTenso
     let dummy_config = crate::config::ModelConfig {
         name: "anonymous".to_string(),
         path: None,
+        task: None,
         hf_repo: None,
         hf_file: None,
         alias: None,
@@ -896,7 +899,7 @@ pub fn synthesize_trt_profiles(
                 }
             }
             2 => {
-                // 2D tensor: e.g. [batch, seq_len] in NLP, Embedding, Reranker
+                // 2D tensor: e.g. [batch, seq_len] in NLP, Embedding, Reranker, or [batch, options] in Decision models
                 let b_min = 1;
                 let b_opt = 1;
                 let b_max = match inp.dims[0] {
@@ -904,9 +907,29 @@ pub fn synthesize_trt_profiles(
                     OnnxDim::Dynamic(_) => batch as i64,
                 };
 
-                let (s_min, s_opt, s_max) = match inp.dims[1] {
-                    OnnxDim::Fixed(s) => (s, s, s),
-                    // Opt stays below max so TRT autotune does not scratch at profile max.
+                let is_options_tensor = {
+                    let lower_name = name.to_ascii_lowercase();
+                    lower_name.contains("option")
+                        || lower_name == "marker_pos"
+                        || lower_name == "marker_mask"
+                        || match &inp.dims[1] {
+                            OnnxDim::Dynamic(param) => {
+                                let p = param.to_ascii_lowercase();
+                                p.contains("option")
+                                    || p.contains("choice")
+                                    || p.contains("candidate")
+                            }
+                            _ => false,
+                        }
+                };
+
+                let (s_min, s_opt, s_max) = match &inp.dims[1] {
+                    OnnxDim::Fixed(s) => (*s, *s, *s),
+                    OnnxDim::Dynamic(_) if is_options_tensor => {
+                        // Decision models (Julia-1, Laya, etc.) evaluate 2..20 options.
+                        // Bound options profile safely to avoid explosive cross-attention scratch allocations.
+                        (1, 4, 32)
+                    }
                     OnnxDim::Dynamic(_) => {
                         let s_max = seq_len as i64;
                         let s_opt = ((seq_len / 2).clamp(64, seq_len)) as i64;

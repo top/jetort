@@ -120,8 +120,13 @@ pub fn create_router(registry: ModelRegistry) -> Router {
         // Vector Search Reranking Extension
         .route("/v1/rerank", post(rerank))
         .route("/rerank", post(rerank))
-        // TypeSafe System One compatible decisions
+        // TypeSafe Decision / System One compatible decisions
+        .route("/v1/decision", post(system_one))
+        .route("/decision", post(system_one))
+        .route("/v1/decide", post(system_one))
+        .route("/decide", post(system_one))
         .route("/v1/systemone", post(system_one))
+        .route("/systemone", post(system_one))
         // OpenAI-compatible Audio Transcriptions
         .route("/v1/audio/transcriptions", post(audio_transcriptions))
         // KServe v2 Model Metadata & Raw Inference

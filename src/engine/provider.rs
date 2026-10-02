@@ -238,7 +238,7 @@ pub fn resolve_trt_dynamic_profiles(
         }),
         config.pad_seq_len,
     );
-    let max_batch = config.max_batch_size.clamp(1, 8);
+    let max_batch = config.max_batch_size.clamp(1, 32);
     let path_to_inspect = model_path.or_else(|| config.path.as_deref().map(std::path::Path::new));
 
     if config.trt_profile_min_shapes.is_none() {
@@ -389,12 +389,12 @@ pub fn trt_runtime_profile_bounds(
         }
     }
     // Legacy caches / empty signatures were built with pad_seq_len.unwrap_or(512).
-    let max_batch = config.max_batch_size.clamp(1, 8);
+    let max_batch = config.max_batch_size.clamp(1, 32);
     crate::engine::provider_chain::TrtProfileBounds {
         min_batch: 1,
         max_batch,
         min_seq: 1,
-        max_seq: config.pad_seq_len.unwrap_or(512).clamp(64, 512),
+        max_seq: config.pad_seq_len.unwrap_or(512).clamp(64, 4096),
         opt_batch: 1,
         opt_seq: 256.min(config.pad_seq_len.unwrap_or(512)),
     }
@@ -498,7 +498,7 @@ pub struct TrtBuilderPolicy {
 pub fn jetson_trt_builder_policy() -> TrtBuilderPolicy {
     TrtBuilderPolicy {
         optimization_level: 0,
-        max_workspace_mb: 256,
+        max_workspace_mb: 2048,
         force_sequential_engine_build: true,
         // ORT warns this is deprecated on TRT ≥8.6 and only meaningful at level 2.
         build_heuristics: false,
@@ -509,7 +509,7 @@ pub fn jetson_trt_builder_policy() -> TrtBuilderPolicy {
 pub fn discrete_gpu_trt_builder_policy() -> TrtBuilderPolicy {
     TrtBuilderPolicy {
         optimization_level: 3,
-        max_workspace_mb: 512,
+        max_workspace_mb: 4096,
         force_sequential_engine_build: false,
         build_heuristics: false,
     }
@@ -526,18 +526,25 @@ pub fn trt_builder_policy() -> TrtBuilderPolicy {
 
 fn trt_workspace_mb(config: &ModelConfig, available_mb: f64) -> usize {
     let policy = trt_builder_policy();
-    let requested = config.trt_max_workspace_mb.unwrap_or_else(|| {
-        if available_mb >= 4000.0 {
-            512
-        } else if available_mb >= 2000.0 {
-            384
+    if let Some(user_req) = config.trt_max_workspace_mb {
+        // Honor user-specified workspace, bounded only by safe available headroom
+        let safe_ceiling = if available_mb > 2000.0 {
+            ((available_mb - 1500.0).max(512.0) as usize).min(policy.max_workspace_mb)
         } else {
-            256
-        }
-    });
-    // Never ask TensorRT for multi-GB tactic scratch on any target; Jetson policy
-    // hard-caps at 512 MB even if config asks for more.
-    requested.min(policy.max_workspace_mb).max(64)
+            512
+        };
+        return user_req.min(safe_ceiling).max(64);
+    }
+
+    // Dynamic scaling based on available system memory
+    let dynamic_target = if available_mb >= 4000.0 {
+        1024
+    } else if available_mb >= 2000.0 {
+        768
+    } else {
+        512
+    };
+    dynamic_target.min(policy.max_workspace_mb).max(64)
 }
 
 fn estimated_trt_build_memory_mb(model_size_mb: usize, workspace_mb: usize) -> usize {
@@ -863,9 +870,9 @@ pub fn build_tensorrt_ep(
         ModelPrecision::Fp32 => {
             info!(
                 model = %config.name,
-                "Enabling TensorRT FP32 precision (INT8 disabled, FP16 disabled)"
+                "Enabling TensorRT FP32 precision (with FP16 mixed-precision acceleration)"
             );
-            trt = trt.with_int8(false).with_fp16(false);
+            trt = trt.with_int8(false).with_fp16(true);
         }
     }
 
@@ -1170,7 +1177,7 @@ mod tests {
     fn jetson_builder_policy_sets_level_and_workspace() {
         let jetson = jetson_trt_builder_policy();
         assert_eq!(jetson.optimization_level, 0);
-        assert_eq!(jetson.max_workspace_mb, 256);
+        assert_eq!(jetson.max_workspace_mb, 2048);
         assert!(jetson.force_sequential_engine_build);
         assert!(!jetson.build_heuristics);
 
@@ -1182,7 +1189,7 @@ mod tests {
         #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         {
             assert_eq!(selected.optimization_level, 3);
-            assert_eq!(selected.max_workspace_mb, 512);
+            assert_eq!(selected.max_workspace_mb, 4096);
         }
     }
 

@@ -1390,8 +1390,22 @@ impl OneShotSession {
                 "Detected calibrated GLiClass System One model contract"
             );
         }
-        let openjev = load_openjev_calibration(model_dir);
-        if openjev.is_some() {
+        let mut openjev = load_openjev_calibration(model_dir);
+        if openjev.is_none() && decision_temperatures.is_none() {
+            let has_marker_inputs = inputs_metadata.iter().any(|m| m.name == "marker_pos");
+            if has_marker_inputs || config.task == Some(crate::engine::task::ModelTask::Decision) {
+                openjev = Some(OpenJevCalibration {
+                    max_len: 512,
+                    head_max_len: 256,
+                    temperature: [1.0, 1.0, 1.0],
+                    temperature_by_options: HashMap::new(),
+                });
+                info!(
+                    model = %config.name,
+                    "Detected OpenJev decision model graph structure; initialized default calibration"
+                );
+            }
+        } else if openjev.is_some() {
             info!(
                 model = %config.name,
                 "Detected calibrated OpenJev rl-agent System One model contract"
@@ -2009,7 +2023,7 @@ impl OneShotSession {
             let aligned_len = max_len_in_chunk.div_ceil(8) * 8;
             let max_safe_len = (((max_tile_bytes / (batch_size.max(1) * 16 * 4)) as f64).sqrt()
                 as usize)
-                .clamp(128, 512);
+                .clamp(128, self.n_ctx.clamp(512, 8192));
             let effective_seq_len = provider_chain::resolve_seq_pad(
                 self.pad_seq_len,
                 provider,
@@ -2221,14 +2235,39 @@ impl OneShotSession {
             return Ok((vec![], 0, self.active_provider.clone()));
         }
 
-        let pairs: Vec<(String, String)> = documents
-            .iter()
-            .map(|doc| (query.to_string(), doc.clone()))
-            .collect();
+        let is_qwen_or_chat = self.name.to_lowercase().contains("qwen")
+            || self.model_config.path.as_ref().map_or(false, |p| {
+                let dir = std::path::Path::new(p);
+                let dir = if dir.is_file() {
+                    dir.parent().unwrap_or(dir)
+                } else {
+                    dir
+                };
+                dir.join("chat_template.jinja").exists()
+            });
 
-        let all_encodings = tokenizer
-            .encode_batch(pairs, true)
-            .map_err(|e| AppError::Tokenizer(format!("Tokenization error in rerank: {}", e)))?;
+        let all_encodings = if is_qwen_or_chat {
+            let prompts: Vec<String> = documents
+                .iter()
+                .map(|doc| {
+                    format!(
+                        "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: Given a web search query, retrieve relevant passages that answer the query\n<Query>: {}\n<Document>: {}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                        query, doc
+                    )
+                })
+                .collect();
+            tokenizer
+                .encode_batch(prompts, true)
+                .map_err(|e| AppError::Tokenizer(format!("Tokenization error in rerank: {}", e)))?
+        } else {
+            let pairs: Vec<(String, String)> = documents
+                .iter()
+                .map(|doc| (query.to_string(), doc.clone()))
+                .collect();
+            tokenizer
+                .encode_batch(pairs, true)
+                .map_err(|e| AppError::Tokenizer(format!("Tokenization error in rerank: {}", e)))?
+        };
 
         let total_prompt_tokens: usize = all_encodings.iter().map(|e| e.get_ids().len()).sum();
         let max_seq_raw = all_encodings
@@ -2317,7 +2356,7 @@ impl OneShotSession {
             let aligned_len = max_len_in_chunk.div_ceil(8) * 8;
             let max_safe_len = (((max_tile_bytes / (batch_size.max(1) * 16 * 4)) as f64).sqrt()
                 as usize)
-                .clamp(128, 512);
+                .clamp(128, self.n_ctx.clamp(512, 8192));
             let effective_seq_len = provider_chain::resolve_seq_pad(
                 self.pad_seq_len,
                 provider,
@@ -2377,8 +2416,17 @@ impl OneShotSession {
                 ));
             };
 
-            for &logit in data.iter().take(batch_size) {
-                scores_out.push(1.0 / (1.0 + (-logit).exp()));
+            let is_already_probability = self.outputs_metadata.iter().any(|m| {
+                m.name == "relevance_score" || m.name == "probabilities" || m.name == "scores"
+            });
+
+            for &val in data.iter().take(batch_size) {
+                let score = if is_already_probability {
+                    val.clamp(0.0, 1.0)
+                } else {
+                    1.0 / (1.0 + (-val).exp())
+                };
+                scores_out.push(score);
             }
 
             Ok(())
@@ -2608,16 +2656,27 @@ impl OneShotSession {
             ))
         })?;
 
-        let cls_id = tokenizer.token_to_id("[CLS]").ok_or_else(|| {
-            AppError::Tokenizer("OpenJev tokenizer is missing a [CLS] token".to_string())
-        })?;
-        let sep_id = tokenizer.token_to_id("[SEP]").ok_or_else(|| {
-            AppError::Tokenizer("OpenJev tokenizer is missing a [SEP] token".to_string())
-        })?;
-        let mask_id = tokenizer.token_to_id("[MASK]").ok_or_else(|| {
-            AppError::Tokenizer("OpenJev tokenizer is missing a [MASK] token".to_string())
-        })?;
-        let pad_id = tokenizer.token_to_id("[PAD]").unwrap_or(0);
+        let cls_id = tokenizer
+            .token_to_id("[CLS]")
+            .or_else(|| tokenizer.token_to_id("<bos>"))
+            .or_else(|| tokenizer.token_to_id("<s>"))
+            .unwrap_or(2);
+        let sep_id = tokenizer
+            .token_to_id("[SEP]")
+            .or_else(|| tokenizer.token_to_id("<eos>"))
+            .or_else(|| tokenizer.token_to_id("</s>"))
+            .unwrap_or(1);
+        let mask_id = tokenizer
+            .token_to_id("[MASK]")
+            .or_else(|| tokenizer.token_to_id("<mask_1>"))
+            .or_else(|| tokenizer.token_to_id("<mask_0>"))
+            .or_else(|| tokenizer.token_to_id("<mask>"))
+            .or_else(|| tokenizer.token_to_id("<extra_id_0>"))
+            .unwrap_or(4);
+        let pad_id = tokenizer
+            .token_to_id("[PAD]")
+            .or_else(|| tokenizer.token_to_id("<pad>"))
+            .unwrap_or(0);
         let mask_token_str = "[MASK]";
 
         let marker_capacity = self
@@ -3104,38 +3163,71 @@ impl ModelEngine {
         "onnxruntime"
     }
 
+    pub fn resolved_task(&self) -> crate::engine::task::ModelTask {
+        let inputs: Vec<crate::engine::onnx_introspect::OnnxInputTensorInfo> = self
+            .session
+            .inputs_metadata
+            .iter()
+            .map(|m| crate::engine::onnx_introspect::OnnxInputTensorInfo {
+                name: m.name.clone(),
+                elem_type: 0,
+                dims: m
+                    .shape
+                    .iter()
+                    .map(|&d| {
+                        if d < 0 {
+                            crate::engine::onnx_introspect::OnnxDim::Dynamic("dyn".into())
+                        } else {
+                            crate::engine::onnx_introspect::OnnxDim::Fixed(d)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let outputs: Vec<crate::engine::onnx_introspect::OnnxOutputTensorInfo> = self
+            .session
+            .outputs_metadata
+            .iter()
+            .map(|m| crate::engine::onnx_introspect::OnnxOutputTensorInfo {
+                name: m.name.clone(),
+                elem_type: 0,
+                dims: m
+                    .shape
+                    .iter()
+                    .map(|&d| {
+                        if d < 0 {
+                            crate::engine::onnx_introspect::OnnxDim::Dynamic("dyn".into())
+                        } else {
+                            crate::engine::onnx_introspect::OnnxDim::Fixed(d)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        crate::engine::task::resolve_task(
+            self.session.model_config.task,
+            Some(&self.session.model_path),
+            &inputs,
+            &outputs,
+            self.session.model_config.alias.as_deref(),
+        )
+    }
+
     pub fn supports_system_one(&self) -> bool {
-        self.session.supports_system_one()
+        self.resolved_task() == crate::engine::task::ModelTask::Decision
+            || self.session.supports_system_one()
     }
 
     pub fn supported_endpoints(&self) -> Vec<String> {
-        let session = &self.session;
-        let mut endpoints = Vec::new();
-        if session.supports_system_one() {
-            endpoints.push("/v1/systemone".to_string());
+        let task = self.resolved_task();
+        let endpoints = crate::engine::task::endpoints_for_task(task);
+        if !endpoints.is_empty() {
+            endpoints
         } else {
-            if session.outputs_metadata.iter().any(|output| {
-                output.name == "sentence_embedding" || output.name == "last_hidden_state"
-            }) {
-                endpoints.push("/v1/embeddings".to_string());
-            }
-            if session
-                .outputs_metadata
-                .iter()
-                .any(|output| output.name == "logits")
-                && session.tokenizer.is_some()
-            {
-                endpoints.push("/v1/rerank".to_string());
-            }
+            vec![]
         }
-        if session.inputs_metadata.iter().any(|input| {
-            input.name == "features"
-                || input.name == "speech"
-                || (input.shape.len() == 3 && input.shape.last().copied() == Some(80))
-        }) {
-            endpoints.push("/v1/audio/transcriptions".to_string());
-        }
-        endpoints
     }
 
     pub async fn acquire_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, AppError> {

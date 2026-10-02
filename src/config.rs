@@ -87,6 +87,10 @@ pub struct ModelConfig {
     #[serde(default)]
     pub alias: Option<String>,
 
+    /// Explicit task/paradigm ("auto", "decision", "rerank", "embedding", "classification", "asr")
+    #[serde(default, alias = "type")]
+    pub task: Option<crate::engine::task::ModelTask>,
+
     /// Load this model during startup after all TensorRT cache compilation completes.
     #[serde(default = "default_true")]
     pub load_on_startup: bool,
@@ -208,7 +212,7 @@ pub struct ModelConfig {
     pub engine_kind: Option<EngineKind>,
 }
 
-pub const CONCURRENCY_CAP: usize = 5;
+pub const CONCURRENCY_CAP: usize = 32;
 
 fn default_session_pool_size() -> usize {
     1

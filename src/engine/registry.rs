@@ -1,6 +1,6 @@
 use crate::config::{AppConfig, EngineKind, ModelConfig};
 use crate::engine::header_prober::{
-    builtin_alias_matches, engine_label, probe_model_bundle, resolve_model_task, ModelTask,
+    builtin_alias_matches, engine_label, probe_model_bundle, ModelTask,
 };
 use crate::engine::session::{inspect_or_fallback, resolve_model_and_tokenizer_path, ModelSession};
 use crate::error::AppError;
@@ -98,16 +98,18 @@ impl ModelEntry {
 fn classify_configured_model(config: &ModelConfig) -> (ModelTask, EngineKind) {
     let Ok((path, _)) = resolve_model_and_tokenizer_path(config) else {
         return (
-            resolve_model_task(None, config.alias.as_deref(), false),
+            crate::engine::task::resolve_task(config.task, None, &[], &[], config.alias.as_deref()),
             EngineKind::OneShot,
         );
     };
     let inspection = inspect_or_fallback(&path, config);
     let probe = probe_model_bundle(&path, Some(&inspection), config.engine_kind);
-    let task = resolve_model_task(
-        Some(&inspection),
+    let task = crate::engine::task::resolve_task(
+        config.task,
+        Some(&path),
+        &inspection.inputs,
+        &inspection.outputs,
         config.alias.as_deref(),
-        probe.has_audio_encoder,
     );
     (task, probe.kind)
 }

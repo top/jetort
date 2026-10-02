@@ -260,9 +260,16 @@ pub fn canonical_provider_name(name: &str) -> String {
 
 pub const TRT_PAD_BUCKETS: [usize; 4] = [128, 256, 512, 1024];
 
-/// Hard cap when synthesizing a new TensorRT profile max sequence on Jetson.
-/// Longer inputs fall through to CUDA/CPU; do not build an 8192-seq engine by default.
+/// Hard cap when synthesizing a new TensorRT profile max sequence.
+/// On Jetson UMA architectures, multi-layer transformers (like Qwen3 28L) require
+/// quadratic tactic workspace; capping default auto-profile sequence to 512 prevents NvMap ENOMEM.
+/// Longer inputs seamlessly fall back to CUDA/CPU at runtime.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const TRT_PROFILE_SEQ_CAP: usize = 512;
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
 pub const TRT_PROFILE_SEQ_CAP: usize = 2048;
+
 
 /// Active TensorRT optimization-profile bounds for one loaded engine.
 /// Runtime must never call setInputShape outside these bounds.
@@ -405,10 +412,12 @@ pub fn trt_profile_bounds_from_signature(signature: &str) -> Option<TrtProfileBo
 /// Never silently stick at 512 when the model advertises a larger context, and never build
 /// a 131072-seq profile on Jetson.
 pub fn trt_compile_max_seq(n_ctx: Option<usize>, pad_seq_len: Option<usize>) -> usize {
-    let from_ctx = n_ctx.filter(|v| *v > 0);
     let from_pad = pad_seq_len.filter(|v| *v > 0);
-    let raw = from_pad.or(from_ctx).unwrap_or(512);
-    raw.clamp(64, TRT_PROFILE_SEQ_CAP)
+    if let Some(pad) = from_pad {
+        return pad.clamp(64, 4096);
+    }
+    let from_ctx = n_ctx.filter(|v| *v > 0).unwrap_or(512);
+    from_ctx.clamp(64, TRT_PROFILE_SEQ_CAP)
 }
 
 /// Smallest pad bucket that can hold `seq_len` and still fits inside the loaded profile.
@@ -722,9 +731,13 @@ mod tests {
         assert_eq!(from_sig, bounds);
 
         assert_eq!(trt_compile_max_seq(Some(8192), None), TRT_PROFILE_SEQ_CAP);
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
         assert_eq!(trt_compile_max_seq(Some(1024), None), 1024);
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(trt_compile_max_seq(Some(1024), None), TRT_PROFILE_SEQ_CAP);
+        assert_eq!(trt_compile_max_seq(Some(256), None), 256);
         assert_eq!(trt_compile_max_seq(None, Some(512)), 512);
-        // Large model context must cap at 2048, not silent 512 and not raw 131072.
+        // Large model context must cap at TRT_PROFILE_SEQ_CAP, not silent 512 and not raw 131072.
         assert_eq!(trt_compile_max_seq(Some(131072), None), TRT_PROFILE_SEQ_CAP);
         assert_eq!(trt_compile_max_seq(Some(131072), Some(768)), 768);
     }
