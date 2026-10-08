@@ -14,6 +14,70 @@ pub enum ModelTask {
     Custom,
 }
 
+/// Protocol used by a one-shot decision model. This is separate from
+/// `ModelTask`: the task is the public capability, while the contract defines
+/// how the graph and tokenizer exchange decision scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecisionContract {
+    Auto,
+    Gliclass,
+    OpenJev,
+    CandidateLogits,
+    TokenLogits,
+    D1,
+}
+
+impl DecisionContract {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gliclass => "gliclass",
+            Self::OpenJev => "openjev",
+            Self::CandidateLogits => "candidate_logits",
+            Self::TokenLogits => "token_logits",
+            Self::D1 => "d1",
+        }
+    }
+
+    pub fn from_str_tolerant(s: &str) -> Self {
+        let lower = s.trim().to_ascii_lowercase().replace(['-', '_'], "");
+        match lower.as_str() {
+            "" | "auto" | "default" => Self::Auto,
+            "gliclass" => Self::Gliclass,
+            "openjev" | "jev" | "laya" => Self::OpenJev,
+            "candidatelogits" | "options" | "optionlogits" => Self::CandidateLogits,
+            "tokenlogits" | "vocablogits" | "vocabularylogits" => Self::TokenLogits,
+            "d1" => Self::D1,
+            _ => Self::Auto,
+        }
+    }
+}
+
+impl Serialize for DecisionContract {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DecisionContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_str_tolerant(&s))
+    }
+}
+
+impl std::fmt::Display for DecisionContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl ModelTask {
     pub const AUDIO: ModelTask = ModelTask::Asr;
     pub const UNKNOWN: ModelTask = ModelTask::Custom;
@@ -316,6 +380,22 @@ mod tests {
         assert_eq!(ModelTask::from_str_tolerant("asr"), ModelTask::Asr);
         assert_eq!(ModelTask::from_str_tolerant("audio"), ModelTask::Asr);
         assert_eq!(ModelTask::from_str_tolerant("auto"), ModelTask::Auto);
+    }
+
+    #[test]
+    fn parses_decision_contract_aliases() {
+        assert_eq!(
+            DecisionContract::from_str_tolerant("candidate-logits"),
+            DecisionContract::CandidateLogits
+        );
+        assert_eq!(
+            DecisionContract::from_str_tolerant("vocab_logits"),
+            DecisionContract::TokenLogits
+        );
+        assert_eq!(
+            DecisionContract::from_str_tolerant("d1"),
+            DecisionContract::D1
+        );
     }
 
     #[test]

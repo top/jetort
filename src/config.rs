@@ -91,6 +91,13 @@ pub struct ModelConfig {
     #[serde(default, alias = "type")]
     pub task: Option<crate::engine::task::ModelTask>,
 
+    /// Optional decision-model protocol. This is intentionally configured in
+    /// config.yaml rather than discovered from files beside the ONNX graph.
+    /// Supported values are contract families such as "gliclass",
+    /// "openjev", "candidate_logits", and "d1".
+    #[serde(default, alias = "decision-contract", alias = "decision_type")]
+    pub decision_contract: Option<crate::engine::task::DecisionContract>,
+
     /// Load this model during startup after all TensorRT cache compilation completes.
     #[serde(default = "default_true")]
     pub load_on_startup: bool,
@@ -353,5 +360,40 @@ impl AppConfig {
             model.concurrency_limit = Some(concurrency);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::task::DecisionContract;
+
+    #[test]
+    fn decision_contract_is_optional_and_yaml_configured() {
+        let config: AppConfig = serde_yaml::from_str(
+            r#"
+models:
+  - name: d1
+    path: /models/d1/model.onnx
+    task: decision
+    decision_contract: d1
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.models[0].task,
+            Some(crate::engine::task::ModelTask::Decision)
+        );
+        assert_eq!(config.models[0].decision_contract, Some(DecisionContract::D1));
+
+        let ordinary: AppConfig = serde_yaml::from_str(
+            r#"
+models:
+  - name: embedding
+    path: /models/embedding/model.onnx
+"#,
+        )
+        .unwrap();
+        assert_eq!(ordinary.models[0].decision_contract, None);
     }
 }

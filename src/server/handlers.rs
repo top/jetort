@@ -181,7 +181,14 @@ pub async fn system_one(State(registry): State<ModelRegistry>, request: Request)
         let queue_ms = queue_started.elapsed().as_secs_f64() * 1000.0;
         let model = session.name().to_string();
         let backend = session.active_provider().to_string();
-        let (answers, input_tokens) = if session.uses_openjev_contract() {
+        let (answers, input_tokens) = if session.uses_d1_contract() {
+            let task = tokio::task::spawn_blocking(move || {
+                session.system_one_d1(&request.state, &request.questions)
+            });
+            task.await.map_err(|error| {
+                AppError::Internal(format!("System One task join error: {error}"))
+            })??
+        } else if session.uses_openjev_contract() {
             let task = tokio::task::spawn_blocking(move || {
                 session.system_one_openjev(&request.state, &request.questions)
             });

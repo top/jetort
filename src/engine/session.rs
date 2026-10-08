@@ -539,6 +539,7 @@ pub struct OneShotSession {
     fallback_pool: Mutex<Option<(String, crate::engine::session_pool::SessionPool)>>,
     pub decision_temperatures: Option<DecisionTemperatures>,
     pub openjev: Option<OpenJevCalibration>,
+    pub decision_contract: crate::engine::task::DecisionContract,
 }
 
 impl OneShotSession {
@@ -1463,6 +1464,9 @@ impl OneShotSession {
             fallback_pool: Mutex::new(None),
             decision_temperatures,
             openjev,
+            decision_contract: config
+                .decision_contract
+                .unwrap_or(crate::engine::task::DecisionContract::Auto),
         })
     }
 
@@ -2480,12 +2484,26 @@ impl OneShotSession {
     }
 
     pub fn supports_system_one(&self) -> bool {
-        (self.decision_temperatures.is_some() || self.openjev.is_some())
+        (self.decision_temperatures.is_some()
+            || self.openjev.is_some()
+            || self.decision_contract
+                == crate::engine::task::DecisionContract::CandidateLogits
+            || self.decision_contract == crate::engine::task::DecisionContract::D1)
             && self.tokenizer.is_some()
             && self
                 .outputs_metadata
                 .iter()
                 .any(|output| output.name == "logits")
+    }
+
+    /// The configured one-shot decision protocol. `Auto` preserves the
+    /// legacy companion-file/graph-signature detection behavior.
+    pub fn decision_contract(&self) -> crate::engine::task::DecisionContract {
+        self.decision_contract
+    }
+
+    pub fn uses_d1_contract(&self) -> bool {
+        self.decision_contract == crate::engine::task::DecisionContract::D1
     }
 
     pub fn uses_openjev_contract(&self) -> bool {
@@ -2510,7 +2528,14 @@ impl OneShotSession {
             )));
         }
         let tokenizer = self.tokenizer.as_ref().expect("checked above");
-        let temperatures = self.decision_temperatures.as_ref().expect("checked above");
+        let default_temperatures = DecisionTemperatures {
+            default: 1.0,
+            per_candidate_count: HashMap::new(),
+        };
+        let temperatures = self
+            .decision_temperatures
+            .as_ref()
+            .unwrap_or(&default_temperatures);
         let mut answers = std::collections::BTreeMap::new();
         let mut total_tokens = 0;
 
@@ -2617,6 +2642,141 @@ impl OneShotSession {
             }
         }
 
+        Ok((answers, total_tokens))
+    }
+
+    /// Executes Liquid d1's text-only one-shot contract. The ONNX graph
+    /// returns vocabulary logits at the answer slot; this method performs the
+    /// model-independent token readout and maps it to the public response.
+    pub fn system_one_d1(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<
+            String,
+            crate::protocol::system_one::SystemOneQuestion,
+        >,
+    ) -> Result<
+        (
+            std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneAnswer>,
+            usize,
+        ),
+        AppError,
+    > {
+        use crate::protocol::system_one as s1;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            AppError::Tokenizer(format!("Model '{}' has no tokenizer for d1", self.name))
+        })?;
+        let bos = tokenizer
+            .get_vocab(true)
+            .contains_key("<|startoftext|>")
+            .then_some("<|startoftext|>")
+            .unwrap_or("");
+        let output_name = self
+            .outputs_metadata
+            .iter()
+            .find(|output| output.name == "logits")
+            .map(|output| output.name.as_str())
+            .unwrap_or_else(|| self.outputs_metadata[0].name.as_str());
+        let mut answers = std::collections::BTreeMap::new();
+        let mut total_tokens = 0usize;
+
+        for (id, question) in questions {
+            let aliases = s1::d1_aliases(question);
+            let prompt = s1::d1_prompt(state, question, &aliases, bos);
+            let encoding = tokenizer
+                .encode(prompt, false)
+                .map_err(|error| AppError::Tokenizer(format!("d1 tokenization failed: {error}")))?;
+            let ids: Vec<i64> = encoding.get_ids().iter().map(|id| *id as i64).collect();
+            if ids.is_empty() {
+                return Err(AppError::Unprocessable(format!("questions.{id} produced an empty d1 prompt")));
+            }
+            total_tokens += ids.len();
+            let input_ids = if self
+                .inputs_metadata
+                .iter()
+                .find(|input| input.name == "input_ids")
+                .map(|input| input.datatype.to_ascii_uppercase().contains("INT32"))
+                .unwrap_or(false)
+            {
+                Tensor::from_array(([1usize, ids.len()], ids.iter().map(|id| *id as i32).collect::<Vec<_>>().into_boxed_slice()))
+                    .map_err(|e| AppError::Inference(e.to_string()))?
+                    .into_dyn()
+            } else {
+                Tensor::from_array(([1usize, ids.len()], ids.into_boxed_slice()))
+                    .map_err(|e| AppError::Inference(e.to_string()))?
+                    .into_dyn()
+            };
+            let mut inputs = HashMap::new();
+            inputs.insert("input_ids".to_string(), input_ids);
+            let outputs = self.infer_raw_with_targets(inputs, Some(&[output_name]))?;
+            let output = outputs
+                .get(output_name)
+                .or_else(|| outputs.values().next())
+                .ok_or_else(|| AppError::Inference("d1 produced no logits".to_string()))?;
+            let (shape, logits): (Vec<i64>, Vec<f32>) =
+                if let Ok((shape, values)) = output.try_extract_tensor::<f32>() {
+                    (shape.to_vec(), values.to_vec())
+                } else if let Ok((shape, values)) = output.try_extract_tensor::<f16>() {
+                    (shape.to_vec(), values.iter().map(|value| value.to_f32()).collect())
+                } else {
+                    return Err(AppError::Inference("d1 logits must be FP32 or FP16".to_string()));
+                };
+            if shape.len() != 2 || shape[0] != 1 {
+                return Err(AppError::Inference(format!("Unexpected d1 logits shape: {shape:?}")));
+            }
+            let vocab = shape[1] as usize;
+            let token_ids = |texts: &[String]| -> Result<Vec<u32>, AppError> {
+                texts.iter().try_fold(Vec::new(), |mut out, text| {
+                    let encoded = tokenizer
+                        .encode(text.as_str(), false)
+                        .map_err(|error| AppError::Tokenizer(format!("d1 readout tokenization failed: {error}")))?;
+                    if encoded.get_ids().len() == 1 {
+                        out.push(encoded.get_ids()[0]);
+                    }
+                    Ok(out)
+                })
+            };
+            let groups: Vec<Vec<u32>> = match question {
+                s1::SystemOneQuestion::Noul { .. } => vec![
+                    token_ids(&["yes".into(), "Yes".into(), "YES".into()])?,
+                    token_ids(&["no".into(), "No".into(), "NO".into()])?,
+                ],
+                s1::SystemOneQuestion::Score { criteria, .. } => (0..criteria.len())
+                    .map(|index| token_ids(&[index.to_string()]))
+                    .collect::<Result<_, _>>()?,
+                s1::SystemOneQuestion::Choice { .. } => aliases
+                    .iter()
+                    .map(|alias| token_ids(&[alias.clone(), format!(" {alias}")]))
+                    .collect::<Result<_, _>>()?,
+            };
+            if groups.iter().any(|group| group.is_empty()) {
+                return Err(AppError::Unprocessable(format!(
+                    "d1 tokenizer has no single-token readout for question '{id}'"
+                )));
+            }
+            let scores: Vec<f32> = groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .filter_map(|token| logits.get(*token as usize).copied())
+                        .fold(f32::NEG_INFINITY, f32::max)
+                })
+                .collect();
+            if scores.len() == 0 || scores.iter().any(|score| !score.is_finite()) || logits.len() < vocab {
+                return Err(AppError::Inference(format!("Invalid d1 readout logits for '{id}'")));
+            }
+            let probabilities = s1::calibrated_probabilities(&scores, 1.0);
+            let option_ids = match question {
+                s1::SystemOneQuestion::Noul { .. } => vec!["false".into(), "true".into()],
+                s1::SystemOneQuestion::Score { criteria, .. } =>
+                    (0..criteria.len()).map(|index| index.to_string()).collect(),
+                s1::SystemOneQuestion::Choice { criteria, .. } =>
+                    criteria.keys().cloned().collect(),
+            };
+            let answer = s1::answer_question_openjev(id, question, &option_ids, &probabilities)?;
+            answers.insert(id.clone(), answer);
+        }
         Ok((answers, total_tokens))
     }
 
@@ -3289,6 +3449,14 @@ impl ModelEngine {
         self.session.uses_openjev_contract()
     }
 
+    pub fn uses_d1_contract(&self) -> bool {
+        self.session.uses_d1_contract()
+    }
+
+    pub fn decision_contract(&self) -> crate::engine::task::DecisionContract {
+        self.session.decision_contract()
+    }
+
     pub fn system_one_openjev(
         &self,
         state: &serde_json::Value,
@@ -3304,6 +3472,23 @@ impl ModelEngine {
         AppError,
     > {
         self.session.system_one_openjev(state, questions)
+    }
+
+    pub fn system_one_d1(
+        &self,
+        state: &serde_json::Value,
+        questions: &std::collections::BTreeMap<
+            String,
+            crate::protocol::system_one::SystemOneQuestion,
+        >,
+    ) -> Result<
+        (
+            std::collections::BTreeMap<String, crate::protocol::system_one::SystemOneAnswer>,
+            usize,
+        ),
+        AppError,
+    > {
+        self.session.system_one_d1(state, questions)
     }
 }
 

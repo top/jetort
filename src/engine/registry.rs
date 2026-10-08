@@ -56,27 +56,44 @@ struct ModelEntry {
 
 impl ModelEntry {
     fn new(config: ModelConfig) -> Self {
-        // ponytail: model_path may be just the ONNX graph (a few hundred KB) with the
-        // actual weights split into a sibling `<file>.data` blob (ONNX external-data
-        // format, used once a model exceeds the 2GB protobuf limit, e.g. ORT-GenAI's
-        // builder output). Summing the whole bundle directory instead of the single
-        // file avoids drastically undercounting memory needs for such models.
-        let estimated_memory_mb = resolve_model_and_tokenizer_path(&config)
+        // Once a matching TensorRT engine exists, runtime residency is
+        // dominated by the serialized engine rather than the source ONNX
+        // bundle. This matters for large external-data graphs such as d1.
+        let estimated_memory_mb = cached_engine_bytes(&config)
+            .map(|bytes| {
+                (bytes.div_ceil(1024 * 1024) as usize)
+                    .saturating_mul(3)
+                    / 2
+                    + 256
+            })
+            .unwrap_or_else(|| {
+        // An ONNX graph may keep weights in a sibling `<file>.data` blob. In
+        // that layout count only the graph and its data blob: the directory
+        // can also contain another precision, tokenizer, or source checkpoint.
+        // For multi-file external data without a single sidecar, retain the
+        // directory fallback because those files are the graph's weight set.
+        resolve_model_and_tokenizer_path(&config)
             .ok()
-            .and_then(|(path, _)| path.parent().map(|dir| dir.to_path_buf()))
-            .map(|dir| {
-                let total_bytes: u64 = std::fs::read_dir(&dir)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .filter_map(|entry| entry.metadata().ok())
-                    .filter(|meta| meta.is_file())
-                    .map(|meta| meta.len())
-                    .sum();
+            .map(|(path, _)| {
+                let sidecar = std::path::PathBuf::from(format!("{}.data", path.display()));
+                let total_bytes = if sidecar.is_file() {
+                    path.metadata().map(|meta| meta.len()).unwrap_or(0)
+                        + sidecar.metadata().map(|meta| meta.len()).unwrap_or(0)
+                } else {
+                    path.parent()
+                        .and_then(|dir| std::fs::read_dir(dir).ok())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| entry.ok()?.metadata().ok())
+                        .filter(|meta| meta.is_file())
+                        .map(|meta| meta.len())
+                        .sum()
+                };
                 let file_mb = total_bytes.div_ceil(1024 * 1024) as usize;
                 file_mb.saturating_mul(3) / 2 + 256
             })
-            .unwrap_or(512);
+            .unwrap_or(512)
+            });
         let (task, engine_kind) = classify_configured_model(&config);
         Self {
             config,
@@ -95,17 +112,54 @@ impl ModelEntry {
     }
 }
 
+fn cached_engine_bytes(config: &ModelConfig) -> Option<u64> {
+    let base = crate::engine::provider::trt_cache_dir(config);
+    let candidates = [
+        std::path::PathBuf::from(&base),
+        std::path::PathBuf::from(format!("{base}/int8")),
+        std::path::PathBuf::from(format!("{base}/fp16")),
+        std::path::PathBuf::from(format!("{base}/fp32")),
+    ];
+    candidates
+        .iter()
+        .filter_map(|dir| {
+            let total = std::fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    let is_engine = path.extension().is_some_and(|ext| ext == "engine")
+                        || path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.contains("engine"));
+                    is_engine
+                        .then(|| entry.metadata().ok().map(|metadata| metadata.len()))
+                        .flatten()
+                })
+                .sum::<u64>();
+            (total > 1024).then_some(total)
+        })
+        .max()
+}
+
 fn classify_configured_model(config: &ModelConfig) -> (ModelTask, EngineKind) {
+    let configured_task = config.task.or_else(|| {
+        config
+            .decision_contract
+            .filter(|contract| *contract != crate::engine::task::DecisionContract::Auto)
+            .map(|_| ModelTask::Decision)
+    });
     let Ok((path, _)) = resolve_model_and_tokenizer_path(config) else {
         return (
-            crate::engine::task::resolve_task(config.task, None, &[], &[], config.alias.as_deref()),
+            crate::engine::task::resolve_task(configured_task, None, &[], &[], config.alias.as_deref()),
             EngineKind::OneShot,
         );
     };
     let inspection = inspect_or_fallback(&path, config);
     let probe = probe_model_bundle(&path, Some(&inspection), config.engine_kind);
     let task = crate::engine::task::resolve_task(
-        config.task,
+        configured_task,
         Some(&path),
         &inspection.inputs,
         &inspection.outputs,
@@ -479,6 +533,13 @@ impl ModelRegistry {
             .await;
         let available = crate::engine::memory::get_memory_snapshot().system_available_mb;
         if available > 0.0 && available < required as f64 {
+            warn!(
+                model = %target.config.name,
+                available_mb = available,
+                required_mb = required,
+                estimated_model_mb = target.estimated_memory_mb,
+                "model load rejected by memory admission"
+            );
             return Err(AppError::ModelNotLoaded {
                 name: target.config.name.clone(),
                 state: "insufficient_memory".to_string(),
@@ -659,6 +720,25 @@ mod tests {
         assert_eq!(memory_reserve_mb(4096.0), 1024);
         assert_eq!(memory_reserve_mb(16384.0), 2048);
         assert_eq!(memory_reserve_mb(65536.0), 4096);
+    }
+
+    #[test]
+    fn sidecar_estimate_ignores_other_bundle_files() {
+        let dir = std::env::temp_dir().join(format!("jetort-estimate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.onnx");
+        std::fs::write(&model, vec![0u8; 1024]).unwrap();
+        std::fs::write(format!("{}.data", model.display()), vec![0u8; 2048]).unwrap();
+        std::fs::write(dir.join("other_precision.onnx"), vec![0u8; 32 * 1024 * 1024]).unwrap();
+
+        let config: ModelConfig = serde_yaml::from_str(&format!(
+            "name: estimate\npath: {}\n",
+            model.display()
+        ))
+        .unwrap();
+        let entry = ModelEntry::new(config);
+        assert_eq!(entry.estimated_memory_mb, 257);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

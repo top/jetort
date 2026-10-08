@@ -274,9 +274,93 @@ fn validate_entry(value: &Value, path: &str) -> Result<(), AppError> {
 
 pub fn entry_text(value: &Value) -> String {
     match value {
-        Value::String(value) => value.clone(),
+        Value::String(value) => format!("{value}\n\n"),
         Value::Null => String::new(),
         value => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+/// Render the text-only Liquid d1 prompt up to the answer slot. This is kept
+/// in the protocol layer so the runtime does not need a Python wrapper.
+pub fn d1_prompt(
+    state: &Value,
+    question: &SystemOneQuestion,
+    aliases: &[String],
+    bos: &str,
+) -> String {
+    let state_text = match state {
+        Value::String(value) => value.clone(),
+        Value::Null => String::new(),
+        value => format!("{}\n\n", serde_json::to_string_pretty(value).unwrap_or_default()),
+    };
+    let mut body = match question {
+        SystemOneQuestion::Choice { instructions, criteria } => {
+            let mut lines = Vec::with_capacity(criteria.len());
+            for ((label, description), code) in criteria.iter().zip(aliases) {
+                let text = if description.is_null() {
+                    label.replace('_', " ")
+                } else {
+                    entry_text(description)
+                };
+                lines.push(format!("{code} {text}"));
+            }
+            format!(
+                "{}\n\nOptions:\n{}\n\nReply with the option code only.",
+                entry_text(instructions),
+                lines.join("\n")
+            )
+        }
+        SystemOneQuestion::Noul { instructions, criteria } => {
+            let mut text = entry_text(instructions);
+            if let Some(criteria) = criteria {
+                if !criteria.true_value.is_null() {
+                    text.push_str(&format!("\nYes: {}", entry_text(&criteria.true_value)));
+                }
+                if !criteria.false_value.is_null() {
+                    text.push_str(&format!("\nNo: {}", entry_text(&criteria.false_value)));
+                }
+            }
+            format!("{text}\n\nReply with yes or no only.")
+        }
+        SystemOneQuestion::Score { instructions, criteria } => {
+            let legend = criteria
+                .iter()
+                .enumerate()
+                .map(|(index, value)| format!("{index} {}", entry_text(value)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{}\n\n{}\n\nReply with a single digit 0-{} only.",
+                entry_text(instructions),
+                legend,
+                criteria.len().saturating_sub(1)
+            )
+        }
+    };
+    body = format!("{body}<|im_end|>\n<|im_start|>assistant\n");
+    format!(
+        "{bos}<|im_start|>user\n{}QUESTION:\n{}",
+        state_text, body
+    )
+}
+
+pub fn d1_aliases(question: &SystemOneQuestion) -> Vec<String> {
+    match question {
+        SystemOneQuestion::Choice { criteria, .. } => criteria
+            .keys()
+            .enumerate()
+            .map(|(index, label)| {
+                if criteria
+                    .keys()
+                    .all(|key| key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic())
+                {
+                    label.clone()
+                } else {
+                    char::from(b'A' + index as u8).to_string()
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -681,5 +765,28 @@ mod tests {
             SystemOneAnswer::Score { score, .. } => assert!(score > 1.99),
             _ => panic!("expected score"),
         }
+    }
+
+    #[test]
+    fn renders_d1_prompt_and_aliases_without_runtime_metadata() {
+        let request: SystemOneRequest = serde_json::from_value(json!({
+            "model": "d1",
+            "state": {"message": "charged twice"},
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which team?",
+                    "criteria": {"billing": "payments", "support": "technical help"}
+                }
+            }
+        }))
+        .unwrap();
+        let question = request.questions.get("route").unwrap();
+        let aliases = d1_aliases(question);
+        assert_eq!(aliases, vec!["A", "B"]);
+        let prompt = d1_prompt(&request.state, question, &aliases, "<|startoftext|>");
+        assert!(prompt.starts_with("<|startoftext|><|im_start|>user"));
+        assert!(prompt.contains("QUESTION:"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 }

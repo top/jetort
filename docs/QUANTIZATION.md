@@ -108,7 +108,30 @@ models:
   - name: "qwen3-embedding"
     path: "./bundles/qwen3-embedding-0.6b/model.onnx"
     provider: "auto"
+
+  # Decision models use the same ONNX loading path. Contract selection is
+  # explicit configuration; no quantization manifest is required at runtime.
+  - name: "d1"
+    path: "./bundles/d1/model.onnx"
+    task: "decision"
+    decision_contract: "d1"
+    tokenizer_path: "./bundles/d1/tokenizer.json"
+    providers: ["auto"]
 ```
+
+For decision models, the runtime configuration has two decision-specific
+properties:
+
+| Property | Values |
+|---|---|
+| `task` | `auto`, `decision`, `rerank`, `embedding`, `classification`, `asr`, `custom` |
+| `decision_contract` | `auto`, `gliclass`, `openjev`, `candidate_logits`, `token_logits`, `d1` |
+
+Use `task: decision` to select the public decision capability and
+`decision_contract: d1` to select the d1 prompt/readout protocol. These fields
+are optional for backward compatibility; when omitted, JetOrt keeps its
+existing graph and companion-file detection. The quantization pipeline does
+not need to generate a manifest that JetOrt must discover or load.
 
 Start the engine:
 ```bash

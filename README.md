@@ -512,6 +512,8 @@ models:
     alias: "jev-latest"            # llama.cpp-style single public alias
     hf_repo: "heman10x/rlcd-modernbert-151m"
     hf_file: "model_fp16.onnx"
+    task: "decision"               # Optional explicit public capability
+    decision_contract: "openjev"   # Optional protocol: d1, token_logits, candidate_logits, openjev, gliclass
     pad_seq_len: null             # Dynamic sequence length (or integer for fixed padding)
     providers: ["auto"]           # "auto", "TensorRT", "CUDA", "CoreML", "CPU"
     load_on_startup: true         # Load after startup TensorRT cache attempts complete
@@ -537,9 +539,29 @@ models:
 ```
 
 JetOrt does not require a model `type`. It detects a decoder loop from the graph and refuses that model. A `genai_config.json` file by itself does not. `engine_kind` is only for the ambiguous case.
-System One bundles are detected from companion files and ONNX input/output metadata. Use the
+System One bundles can use the explicit `task: decision` and optional
+`decision_contract` fields above. The contract is configuration, not a required
+sidecar manifest: JetOrt does not scan model directories for quantization
+pipeline manifests. When omitted, existing companion-file and ONNX-signature
+detection remains available for backward compatibility. Use the
 llama.cpp-style `alias`, `ctx_size`, and `batch_size` names only when an override is needed.
 JetOrt's lifecycle control is `load_on_startup`.
+
+#### Decision model configuration
+
+Decision models have two decision-specific configuration properties:
+
+| Property | Required | Canonical values | Meaning |
+|---|---:|---|---|
+| `task` | No | `auto`, `decision`, `rerank`, `embedding`, `classification`, `asr`, `custom` | Public model capability. Use `decision` for `/v1/systemone` and `/v1/decision`. |
+| `decision_contract` | No | `auto`, `gliclass`, `openjev`, `candidate_logits`, `token_logits`, `d1` | Input/output protocol used by the decision graph and tokenizer. |
+
+For a d1 bundle, configure `task: decision` and `decision_contract: d1`.
+`decision_contract` is only meaningful for decision models. `task` remains the
+capability field; the contract must not be encoded as values such as
+`decision_d1`. Hyphens and underscores are accepted interchangeably
+(`candidate-logits`, `token_logits`, etc.). The existing auto-detection path
+remains available when either field is omitted.
 
 ### Operational Logging
 

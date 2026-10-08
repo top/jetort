@@ -35,6 +35,11 @@ pub enum QuantizationKind {
     Fp16,              // Native Float16
 }
 
+fn path_has_fp16_hint(path: &std::path::Path) -> bool {
+    let path_hint = path.to_string_lossy().to_ascii_lowercase();
+    path_hint.contains("fp16") || path_hint.contains("half")
+}
+
 impl std::fmt::Display for QuantizationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -680,11 +685,7 @@ pub fn inspect_onnx_model(
         && !is_explicit_qdq
         && (inputs.iter().any(|i| i.elem_type == 10)
             || outputs.iter().any(|o| o.elem_type == 10)
-            || path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.contains("fp16") || s.contains("half"))
-                .unwrap_or(false));
+            || path_has_fp16_hint(path));
 
     let quantization_kind = if is_explicit_qdq {
         QuantizationKind::ExplicitQdqInt8
@@ -790,6 +791,7 @@ pub fn introspect_onnx_inputs(path: &Path) -> std::io::Result<Vec<OnnxInputTenso
         name: "anonymous".to_string(),
         path: None,
         task: None,
+        decision_contract: None,
         hf_repo: None,
         hf_file: None,
         alias: None,
@@ -1041,4 +1043,19 @@ pub fn synthesize_trt_profiles(
         opt_shapes: opt_parts.join(","),
         max_shapes: max_parts.join(","),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_has_fp16_hint;
+    use std::path::Path;
+
+    #[test]
+    fn detects_precision_hint_in_parent_directories() {
+        assert!(path_has_fp16_hint(Path::new(
+            "/models/onnx_fp16/model.onnx"
+        )));
+        assert!(path_has_fp16_hint(Path::new("/models/half/model.onnx")));
+        assert!(!path_has_fp16_hint(Path::new("/models/model.onnx")));
+    }
 }
