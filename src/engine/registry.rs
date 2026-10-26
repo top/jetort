@@ -184,6 +184,7 @@ impl Deref for ModelLease {
 impl Drop for ModelLease {
     fn drop(&mut self) {
         let previous = self.entry.active_requests.fetch_sub(1, Ordering::AcqRel);
+        self.entry.last_access.store(now_millis(), Ordering::Relaxed);
         if previous == 1 {
             let mut runtime = self.entry.runtime.lock().expect("model runtime poisoned");
             if runtime.state == ModelState::Unloading {
@@ -377,9 +378,7 @@ impl ModelRegistry {
         if let Some(session) = session {
             entry.active_requests.fetch_add(1, Ordering::AcqRel);
             entry.last_access.store(now_millis(), Ordering::Relaxed);
-            let model_name = entry.config.name.clone();
             let lease = ModelLease { session, entry };
-            self.evict_idle_under_pressure(Some(&model_name)).await;
             return Ok(lease);
         }
 
@@ -413,9 +412,7 @@ impl ModelRegistry {
             if let Some(session) = session {
                 entry.active_requests.fetch_add(1, Ordering::AcqRel);
                 entry.last_access.store(now_millis(), Ordering::Relaxed);
-                let model_name = entry.config.name.clone();
                 let lease = ModelLease { session, entry };
-                self.evict_idle_under_pressure(Some(&model_name)).await;
                 return Ok(lease);
             }
         }
@@ -528,7 +525,11 @@ impl ModelRegistry {
 
     async fn ensure_memory_for(&self, target: &Arc<ModelEntry>) -> Result<(), AppError> {
         let minimum = automatic_memory_reserve_mb();
-        let required = minimum.saturating_add(target.estimated_memory_mb);
+        // Instead of requiring full system reserve (1-4 GB) on top of target model footprint,
+        // use bounded safety headroom (256-512 MB). This eliminates the hysteresis deadlock
+        // where a previously evicted model cannot reload even though the system has ample free memory.
+        let headroom = (minimum / 4).clamp(256, 512);
+        let required = target.estimated_memory_mb.saturating_add(headroom);
         self.evict_until_available(required, Some(&target.config.name))
             .await;
         let available = crate::engine::memory::get_memory_snapshot().system_available_mb;
@@ -546,14 +547,6 @@ impl ModelRegistry {
             });
         }
         Ok(())
-    }
-
-    async fn evict_idle_under_pressure(&self, protected: Option<&str>) {
-        let minimum = automatic_memory_reserve_mb();
-        let available = crate::engine::memory::get_memory_snapshot().system_available_mb;
-        if available > 0.0 && available < minimum as f64 {
-            self.evict_until_available(minimum, protected).await;
-        }
     }
 
     async fn evict_until_available(&self, required_mb: usize, protected: Option<&str>) {
@@ -587,7 +580,7 @@ impl ModelRegistry {
                 model = %victim.config.name,
                 required_mb,
                 available_mb = available,
-                "evicted idle model under memory pressure"
+                "evicted idle model to satisfy memory for incoming model"
             );
         }
     }
@@ -678,17 +671,6 @@ impl ModelRegistry {
 
     pub async fn is_ready(&self) -> bool {
         self.initialized.load(Ordering::Acquire)
-    }
-
-    pub fn start_memory_monitor(&self) {
-        let registry = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-            loop {
-                interval.tick().await;
-                registry.evict_idle_under_pressure(None).await;
-            }
-        });
     }
 }
 

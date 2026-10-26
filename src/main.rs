@@ -70,7 +70,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Model Registry
     let registry = ModelRegistry::new();
     registry.init_from_config(&config).await;
-    registry.start_memory_monitor();
 
     // Create Axum HTTP Router
     let app = create_router(registry);
